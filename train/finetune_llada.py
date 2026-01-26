@@ -6,7 +6,7 @@ import yaml
 from datasets import load_dataset
 import torch.nn.functional as F
 import argparse
-
+import tqdm
 
 # load from config file
 
@@ -95,7 +95,7 @@ def train_loop(model, tokenizer, optimizer, dataset, config, device):
     model.to(device)
     model.train()
 
-    for i, example in enumerate(dataset):
+    for i, example in enumerate(tqdm(dataset)):
         inst = example['instruction']
         output =  example["output"]
         
