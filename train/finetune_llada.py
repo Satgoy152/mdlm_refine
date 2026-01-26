@@ -107,7 +107,7 @@ def train_loop(model, tokenizer, optimizer, dataset, config, device):
         if len(batch) < batch_size:
             continue
         
-        # process batch
+        # for each example in batch, tokenize instruction and output
         all_tokens = []
         all_masks = []
         all_output_starts = []
@@ -122,7 +122,7 @@ def train_loop(model, tokenizer, optimizer, dataset, config, device):
             # full model input
             tokens = torch.cat([inst_tokens, output_tokens], dim = 1)
             all_tokens.append(tokens.squeeze(0))
-            # create mask
+
             output_start = inst_tokens.shape[1]
             all_output_starts.append(output_start)
         
