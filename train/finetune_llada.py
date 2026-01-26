@@ -5,6 +5,7 @@ import wandb
 import yaml
 from datasets import load_dataset
 import torch.nn.functional as F
+from torch.nn.utils.rnn import pad_sequence
 import argparse
 import tqdm
 
@@ -38,7 +39,7 @@ def initialize(config):
 
 # accelerator
 def prepare_model_optimizer_dataset(model, optimizer, dataset):
-    accelerator = Accelerator()
+    accelerator = Accelerator(mixed_precision = 'bf16')
     model, optimizer, dataset = accelerator.prepare(model, optimizer, dataset)# move to device
 
     return model, optimizer, dataset, accelerator
@@ -92,27 +93,52 @@ def train_loop(model, tokenizer, optimizer, dataset, config, device):
     temperature = config['temperature']
     alpha = config['alpha']
 
+    batch_size = config['batch_size']
+    batch = []
+
     model.to(device)
     model.train()
 
+    total_tokens = 0
+
     for i, example in enumerate(tqdm(dataset)):
-        inst = example['instruction']
-        output =  example["output"]
+        # create batch
+        batch.append(example)
+        if len(batch) < batch_size:
+            continue
         
-        #tokenize
-        inst_tokens = tokenizer(inst, return_tensors = "pt", truncation = True, max_length = 512).input_ids
-        output_tokens = tokenizer(output, return_tensors = "pt", truncation = True, max_length = 512).input_ids
+        # process batch
+        all_tokens = []
+        all_masks = []
+        all_output_starts = []
+        for ex in batch:
+            inst = ex['instruction']
+            output =  ex["output"]
+            
+            #tokenize
+            inst_tokens = tokenizer(inst, return_tensors = "pt", truncation = True, max_length = 512).input_ids
+            output_tokens = tokenizer(output, return_tensors = "pt", truncation = True, max_length = 512).input_ids
 
-        # full model input
-        tokens = torch.cat([inst_tokens, output_tokens], dim = 1).to(device)
+            # full model input
+            tokens = torch.cat([inst_tokens, output_tokens], dim = 1)
+            all_tokens.append(tokens.squeeze(0))
+            # create mask
+            output_start = inst_tokens.shape[1]
+            all_output_starts.append(output_start)
+        
 
+        tokens = pad_sequence(all_tokens, batch_first = True, padding_value = tokenizer.pad_token_id)
+        batch_tokens = (tokens != tokenizer.pad_token_id).sum().item()
+        total_tokens += batch_tokens
+        
         # create mask
         mask = torch.zeros_like(tokens, dtype = torch.bool)
-        output_start = inst_tokens.shape[1]
 
-        # mask rate
-        mask_rate = torch.rand(1).item()
-        mask[:, output_start:] = torch.rand(tokens[:, output_start:]) < mask_rate
+        # for each in batch, create a random mask starting from output_start
+        for b, output_start in enumerate(all_output_starts):
+            # mask rate
+            mask_rate = torch.rand(1).item()
+            mask[b, output_start:] = torch.rand(tokens[b, output_start:].shape) < mask_rate
 
         masked_tokens = tokens.clone()
         # apply mask
@@ -133,8 +159,6 @@ def train_loop(model, tokenizer, optimizer, dataset, config, device):
         output_mask[:, output_start:] = True
         unmasked_output = output_mask & ~mask
         unmasked_entropy_1 = entropy_1[unmasked_output].mean().item() if unmasked_output.any() else 0.0 
-
-
 
         # Prepare for STEP 2
         # sample
@@ -173,8 +197,12 @@ def train_loop(model, tokenizer, optimizer, dataset, config, device):
             "unmasked_entropy_1": unmasked_entropy_1,
             "masked_entropy_2": masked_entropy_2,
             "unmasked_entropy_2": unmasked_entropy_2,
+            "tokens_in_batch": batch_tokens,
+            "total_tokens": total_tokens,
             "step": i
         })
+
+        batch = []  # reset batch
 
         if i >= 1: break
 

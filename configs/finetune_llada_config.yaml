@@ -3,3 +3,4 @@ learning_rate: 1e-5
 temperature: 0.0
 alpha: 0.5
 dataset: "yahma/alpaca-cleaned"
+batch_size: 8
