@@ -104,7 +104,7 @@ def calculate_loss(loss_1, loss_2, method = "alpha", a = 0.5):
         return (a * loss_1) + ((1 - a) * loss_2)
 
 # training loop
-def train_loop(model, tokenizer, optimizer, dataset, config, accelerator):
+def train_loop(model, tokenizer, optimizer, dataset, config, accelerator, device):
     temperature = config['temperature']
     alpha = config['alpha']
 
@@ -112,8 +112,11 @@ def train_loop(model, tokenizer, optimizer, dataset, config, accelerator):
     remask_ratio = config['remask_ratio']
     batch = []
 
-    # model.to(device)
+    model.to(device)
     model.train()
+
+    print(f"Model requires_grad: {next(model.parameters()).requires_grad}")
+    print(f"Model training mode: {model.training}")
 
     total_tokens = 0
 
@@ -143,7 +146,7 @@ def train_loop(model, tokenizer, optimizer, dataset, config, accelerator):
         
 
         tokens = pad_sequence(all_tokens, batch_first = True, padding_value = tokenizer.pad_token_id)
-        tokens = tokens.to(accelerator.device)
+        tokens = tokens.to(model.device)
         batch_tokens = (tokens != tokenizer.pad_token_id).sum().item()
         total_tokens += batch_tokens
         
@@ -203,7 +206,7 @@ def train_loop(model, tokenizer, optimizer, dataset, config, accelerator):
         # total loss
         loss = calculate_loss(loss_1, loss_2, method = "alpha", a = alpha)
         # backprop
-        accelerator.backward(loss)
+        loss.backward()
         optimizer.step()
         optimizer.zero_grad()
 
@@ -246,14 +249,15 @@ if __name__ == "__main__":
     print("Config loaded from", args.config_path)
     model, tokenizer, optimizer, dataset, accelerator = initialize(config)
     print("Initialization done.")
-    model, optimizer, dataset, accelerator = prepare_model_optimizer_dataset(model, optimizer, dataset, accelerator)
-    print("Model, optimizer, and dataset prepared.")
+    # model, optimizer, dataset, accelerator = prepare_model_optimizer_dataset(model, optimizer, dataset, accelerator)
+    # print("Model, optimizer, and dataset prepared.")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print("Using device:", device)
     print("Starting training loop...")
-    print(f"Tokenizer mask: {tokenizer.mask_token_id}")
-    train_loop(model, tokenizer, optimizer, dataset, config, accelerator=accelerator)
+    # print(f"Tokenizer mask: {tokenizer.mask_token_id}")
+    
+    train_loop(model, tokenizer, optimizer, dataset, config, accelerator=accelerator, device=device)
 
     print("Training completed. Saving model...")
     save_model(model, accelerator, save_path = "./finetuned_llada")
