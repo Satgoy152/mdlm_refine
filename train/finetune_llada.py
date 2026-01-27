@@ -112,8 +112,10 @@ def train_loop(model, tokenizer, optimizer, dataset, config, accelerator, device
     remask_ratio = config['remask_ratio']
     batch = []
 
-    model.to(device)
+    # model.to(device)
     model.train()
+    input_device = model.device 
+    print(f"Model Input Device: {input_device}")
 
     print(f"Model requires_grad: {next(model.parameters()).requires_grad}")
     print(f"Model training mode: {model.training}")
@@ -146,7 +148,7 @@ def train_loop(model, tokenizer, optimizer, dataset, config, accelerator, device
         
 
         tokens = pad_sequence(all_tokens, batch_first = True, padding_value = tokenizer.pad_token_id)
-        tokens = tokens.to(model.device)
+        tokens = tokens.to(input_device)
         batch_tokens = (tokens != tokenizer.pad_token_id).sum().item()
         total_tokens += batch_tokens
         
@@ -165,8 +167,11 @@ def train_loop(model, tokenizer, optimizer, dataset, config, accelerator, device
 
         # STEP 1: send through model
         logits_1 = model(masked_tokens).logits
+        output_device = logits_1.device
+        target_tokens = tokens.to(output_device)
+        mask_dev = mask.to(output_device)
         # basic model loss
-        loss_1 = torch.nn.functional.cross_entropy(logits_1[mask], tokens[mask])
+        loss_1 = torch.nn.functional.cross_entropy(logits_1[mask_dev], target_tokens[mask_dev])
         # get entropy for unmasked and masked positions
         probs = F.softmax(logits_1, dim = -1)
         entropy_1 = -torch.sum(probs * torch.log(probs + 1e-10) , dim = -1) # (batch, seq_len)
@@ -193,7 +198,7 @@ def train_loop(model, tokenizer, optimizer, dataset, config, accelerator, device
         # STEP 2: send through the model
         logits_2 = model(masked_tokens).logits
         # model loss with the original mask
-        loss_2 = torch.nn.functional.cross_entropy(logits_2[mask], tokens[mask])
+        loss_2 = torch.nn.functional.cross_entropy(logits_2[mask.to(logits_2.device)], tokens.to(logits_2.device)[mask.to(logits_2.device)])
 
         # get entropy for unmasked and masked positions
         probs = F.softmax(logits_2, dim = -1)
@@ -207,11 +212,12 @@ def train_loop(model, tokenizer, optimizer, dataset, config, accelerator, device
         loss = calculate_loss(loss_1, loss_2, method = "alpha", a = alpha)
         # backprop
         loss.backward()
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         optimizer.zero_grad()
 
         # print(masked_entropy_1, unmasked_entropy_1, loss_1.item())
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        # grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
 
         wandb.log({
