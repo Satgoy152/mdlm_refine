@@ -63,7 +63,7 @@ def add_gumbel_noise(logits, temperature):
     gumbel_noise = (- torch.log(noise)) ** temperature
     return logits.exp() / gumbel_noise
 
-def remask_tokens(logits, sampled_tokens, output_start, output_starts, method = "confidence"):
+def remask_tokens(logits, sampled_tokens, output_starts, method = "confidence"):
 
     if method == "confidence":
 
@@ -179,9 +179,11 @@ def train_loop(model, tokenizer, optimizer, dataset, config, accelerator):
         logits_with_noise = add_gumbel_noise(logits_1.detach(), temperature = temperature)
         sampled_tokens = torch.argmax(logits_with_noise, dim=-1)
         # reset prompt
-        sampled_tokens[:, :output_start] = tokens[:, :output_start]
+        for b, start in enumerate(all_output_starts):
+            sampled_tokens[b, :start] = tokens[b, :start]
+
         # remask
-        masked_tokens = remask_tokens(logits_1, sampled_tokens, output_start, all_output_starts)
+        masked_tokens = remask_tokens(logits_1, sampled_tokens, all_output_starts)
 
         # STEP 2: send through the model
         logits_2 = model(masked_tokens).logits
