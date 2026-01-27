@@ -3,7 +3,15 @@ name = "mdlm-refine"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.12"
 dependencies = [
-    "ipykernel>=7.1.0",
+    "accelerate",
+    "argparse",
+    "datasets",
+    "deepspeed>=0.18.4",
+    "ipykernel",
+    "torch",
+    "tqdm",
+    "transformers>=4.35.0,<4.40.0",
+    "wandb>=0.24.0",
 ]

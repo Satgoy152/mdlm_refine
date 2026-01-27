@@ -1,4 +1,5 @@
-from transformers import AutoModelForCausalLM, AutoTokenizer, AdamW
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoModelForMaskedLM
+from torch.optim import AdamW
 import torch
 from accelerate import Accelerator
 import wandb
@@ -7,7 +8,7 @@ from datasets import load_dataset
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
 import argparse
-import tqdm
+from tqdm import tqdm
 
 # load from config file
 
@@ -17,10 +18,13 @@ def load_config(config_path):
     return config
 
 def initialize(config):
-
-    model = AutoModelForCausalLM.from_pretrained('GSAI-ML/LLaDA-8B-Base', trust_remote_code=True)
+    accelerator = Accelerator()
+    model = AutoModelForCausalLM.from_pretrained('GSAI-ML/LLaDA-8B-Base', trust_remote_code=True, torch_dtype=torch.bfloat16, device_map = 'auto')
     tokenizer = AutoTokenizer.from_pretrained('GSAI-ML/LLaDA-8B-Base', trust_remote_code = True)
-    optimizer = AdamW(model.parameters(), lr=config['learning_rate'])
+    # model = AutoModelForMaskedLM.from_pretrained('kuleshov-group/mdlm-owt', trust_remote_code = True)
+    # tokenizer = transformers.AutoTokenizer.from_pretrained('gpt2', trust_remote_code = True)
+    optimizer = AdamW(model.parameters(), lr=float(config['learning_rate']))
+
 
     wandb.init(
         project="llada-finetuning",
@@ -34,12 +38,12 @@ def initialize(config):
 
     dataset = load_dataset(config['dataset'], streaming = True, split = "train")
 
-    return model, tokenizer, optimizer, dataset
+    return model, tokenizer, optimizer, dataset, accelerator
 
 
 # accelerator
-def prepare_model_optimizer_dataset(model, optimizer, dataset):
-    accelerator = Accelerator(mixed_precision = 'bf16')
+def prepare_model_optimizer_dataset(model, optimizer, dataset, accelerator):
+    
     model, optimizer, dataset = accelerator.prepare(model, optimizer, dataset)# move to device
 
     return model, optimizer, dataset, accelerator
@@ -59,7 +63,7 @@ def add_gumbel_noise(logits, temperature):
     gumbel_noise = (- torch.log(noise)) ** temperature
     return logits.exp() / gumbel_noise
 
-def remask_tokens(logits, sampled_tokens, output_start, method = "confidence"):
+def remask_tokens(logits, sampled_tokens, output_start, output_starts, method = "confidence"):
 
     if method == "confidence":
 
@@ -68,35 +72,45 @@ def remask_tokens(logits, sampled_tokens, output_start, method = "confidence"):
         sampled_probs = torch.gather(probs, dim = -1, index = sampled_tokens.unsqueeze(-1)).squeeze(-1)
 
         confidence = sampled_probs.clone()
-        confidence[:, :output_start] = float('inf')
+        
+        for b, output_start in enumerate(output_starts):
+            confidence[b, :output_start] = float('inf')
 
+        masked_tokens = sampled_tokens.clone()
+
+        for b, output_start in enumerate(output_starts):
+            num_to_mask = int(0.5 * (sampled_tokens.shape[1] - output_start))
+            _, lowest_conf_idx = torch.topk(confidence[b], k=num_to_mask, largest=False)
+            masked_tokens[b, lowest_conf_idx] = 126336
+        
         # num of tokens to remask
-        num_to_mask = int(0.5 * (sampled_tokens.shape[1] - output_start))
+        # num_to_mask = int(0.5 * (sampled_tokens.shape[1] - output_start))
         # lowest confident tokens are remasked so find index of them
-        _, lowest_confidence = torch.topk(confidence, k = num_to_mask, largest = False)
+        # _, lowest_confidence = torch.topk(confidence, k = num_to_mask, largest = False)
 
         #create a new mask
-        mask = torch.zeros_like(sampled_tokens, dtype=torch.bool)
-        mask.scatter_(dim = 1, index = lowest_confidence, value = True)
+        # mask = torch.zeros_like(sampled_tokens, dtype=torch.bool)
+        # mask.scatter_(dim = 1, index = lowest_confidence, value = True)
 
     
     # apply mask
-    masked_tokens = sampled_tokens.clone()
-    masked_tokens[mask] = 126336
+    # masked_tokens = sampled_tokens.clone()
+    # masked_tokens[mask] = 126336
+    return masked_tokens
 
 def calculate_loss(loss_1, loss_2, method = "alpha", a = 0.5):
     if method == "alpha":
         return (a * loss_1) + ((1 - a) * loss_2)
 
 # training loop
-def train_loop(model, tokenizer, optimizer, dataset, config, device):
+def train_loop(model, tokenizer, optimizer, dataset, config, accelerator):
     temperature = config['temperature']
     alpha = config['alpha']
 
     batch_size = config['batch_size']
     batch = []
 
-    model.to(device)
+    # model.to(device)
     model.train()
 
     total_tokens = 0
@@ -109,7 +123,6 @@ def train_loop(model, tokenizer, optimizer, dataset, config, device):
         
         # for each example in batch, tokenize instruction and output
         all_tokens = []
-        all_masks = []
         all_output_starts = []
         for ex in batch:
             inst = ex['instruction']
@@ -128,6 +141,7 @@ def train_loop(model, tokenizer, optimizer, dataset, config, device):
         
 
         tokens = pad_sequence(all_tokens, batch_first = True, padding_value = tokenizer.pad_token_id)
+        tokens = tokens.to(accelerator.device)
         batch_tokens = (tokens != tokenizer.pad_token_id).sum().item()
         total_tokens += batch_tokens
         
@@ -167,7 +181,7 @@ def train_loop(model, tokenizer, optimizer, dataset, config, device):
         # reset prompt
         sampled_tokens[:, :output_start] = tokens[:, :output_start]
         # remask
-        masked_tokens = remask_tokens(logits_1, sampled_tokens, output_start)
+        masked_tokens = remask_tokens(logits_1, sampled_tokens, output_start, all_output_starts)
 
         # STEP 2: send through the model
         logits_2 = model(masked_tokens).logits
@@ -185,9 +199,11 @@ def train_loop(model, tokenizer, optimizer, dataset, config, device):
         # total loss
         loss = calculate_loss(loss_1, loss_2, method = "alpha", a = alpha)
         # backprop
-        loss.backward()
+        accelerator.backward(loss)
         optimizer.step()
         optimizer.zero_grad()
+
+        # print(masked_entropy_1, unmasked_entropy_1, loss_1.item())
 
         wandb.log({
             "loss": loss.item(),
@@ -201,10 +217,11 @@ def train_loop(model, tokenizer, optimizer, dataset, config, device):
             "total_tokens": total_tokens,
             "step": i
         })
-
+        
         batch = []  # reset batch
-
-        if i >= 1: break
+    
+    wandb.finish()
+    torch.cuda.empty_cache()
 
 def save_model(model, accelerator, save_path):
     accelerator.wait_for_everyone()
@@ -218,18 +235,18 @@ if __name__ == "__main__":
 
     # load args
     args = parser.parse_args()
-    
     config = load_config(args.config_path)
     print("Config loaded from", args.config_path)
-    model, tokenizer, optimizer, dataset = initialize(config)
+    model, tokenizer, optimizer, dataset, accelerator = initialize(config)
     print("Initialization done.")
-    model, optimizer, dataset, accelerator = prepare_model_optimizer_dataset(model, optimizer, dataset)
+    model, optimizer, dataset, accelerator = prepare_model_optimizer_dataset(model, optimizer, dataset, accelerator)
     print("Model, optimizer, and dataset prepared.")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print("Using device:", device)
     print("Starting training loop...")
-    train_loop(model, tokenizer, optimizer, dataset, config, device)
+    print(f"Tokenizer mask: {tokenizer.mask_token_id}")
+    train_loop(model, tokenizer, optimizer, dataset, config, accelerator=accelerator)
 
     print("Training completed. Saving model...")
     save_model(model, accelerator, save_path = "./finetuned_llada")
