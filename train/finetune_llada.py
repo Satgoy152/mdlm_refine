@@ -63,7 +63,7 @@ def add_gumbel_noise(logits, temperature):
     gumbel_noise = (- torch.log(noise)) ** temperature
     return logits.exp() / gumbel_noise
 
-def remask_tokens(logits, sampled_tokens, output_starts, method = "confidence"):
+def remask_tokens(logits, sampled_tokens, mask, output_starts, remask_ratio, method = "confidence"):
 
     if method == "confidence":
 
@@ -75,11 +75,12 @@ def remask_tokens(logits, sampled_tokens, output_starts, method = "confidence"):
         
         for b, output_start in enumerate(output_starts):
             confidence[b, :output_start] = float('inf')
+            confidence[b, mask[b] == False] = float('inf')
 
         masked_tokens = sampled_tokens.clone()
 
         for b, output_start in enumerate(output_starts):
-            num_to_mask = int(0.5 * (sampled_tokens.shape[1] - output_start))
+            num_to_mask = int(remask_ratio * (mask[b, output_start:].sum().item()))
             _, lowest_conf_idx = torch.topk(confidence[b], k=num_to_mask, largest=False)
             masked_tokens[b, lowest_conf_idx] = 126336
         
@@ -108,6 +109,7 @@ def train_loop(model, tokenizer, optimizer, dataset, config, accelerator):
     alpha = config['alpha']
 
     batch_size = config['batch_size']
+    remask_ratio = config['remask_ratio']
     batch = []
 
     # model.to(device)
@@ -183,7 +185,7 @@ def train_loop(model, tokenizer, optimizer, dataset, config, accelerator):
             sampled_tokens[b, :start] = tokens[b, :start]
 
         # remask
-        masked_tokens = remask_tokens(logits_1, sampled_tokens, all_output_starts)
+        masked_tokens = remask_tokens(logits_1, sampled_tokens, mask, all_output_starts, remask_ratio)
 
         # STEP 2: send through the model
         logits_2 = model(masked_tokens).logits
@@ -206,6 +208,8 @@ def train_loop(model, tokenizer, optimizer, dataset, config, accelerator):
         optimizer.zero_grad()
 
         # print(masked_entropy_1, unmasked_entropy_1, loss_1.item())
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
 
         wandb.log({
             "loss": loss.item(),
@@ -217,6 +221,7 @@ def train_loop(model, tokenizer, optimizer, dataset, config, accelerator):
             "unmasked_entropy_2": unmasked_entropy_2,
             "tokens_in_batch": batch_tokens,
             "total_tokens": total_tokens,
+            "grad_norm": grad_norm,
             "step": i
         })
         
