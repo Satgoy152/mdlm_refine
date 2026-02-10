@@ -1,7 +1,8 @@
 # sample config file for finetuning llada model
-learning_rate: 2e-4
+learning_rate: 2e-5
 temperature: 0.0
-alpha: 0.2
+alpha: 0.5
 dataset: "yahma/alpaca-cleaned"
 batch_size: 4
 remask_ratio: 0.5
+mask_ratio: 0.5
