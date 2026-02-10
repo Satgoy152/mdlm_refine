@@ -71,6 +71,9 @@ def remask_tokens(logits, sampled_tokens, mask, output_starts, remask_ratio, mas
 
         masked_tokens = sampled_tokens.clone()
 
+        if remask_ratio == "random":
+            remask_ratio = torch.rand(1).item()
+
         for b, output_start in enumerate(output_starts):
             num_to_mask = int(remask_ratio * (mask[b, output_start:].sum().item()))
             _, lowest_conf_idx = torch.topk(confidence[b], k=num_to_mask, largest=False)
@@ -153,8 +156,10 @@ def train_loop(model, tokenizer, optimizer, dataset, config, device):
         # for each in batch, create a random mask starting from output_start
         for b, output_start in enumerate(all_output_starts):
             # mask rate
-            # mask_rate = torch.rand(1).item()
-            mask_rate = config["mask_ratio"]
+            if config["mask_ratio"] == "random":
+               mask_rate = torch.rand(1).item()
+            else:
+                mask_rate = config["mask_ratio"]
             mask[b, output_start:] = torch.rand(tokens[b, output_start:].shape) < mask_rate
 
         masked_tokens = tokens.clone()
