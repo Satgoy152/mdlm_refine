@@ -19,8 +19,6 @@ def load_config(config_path):
 
 def initialize(config):
     
-    # model = AutoModelForCausalLM.from_pretrained('GSAI-ML/LLaDA-8B-Instruct', trust_remote_code=True, torch_dtype=torch.bfloat16, device_map = 'auto')
-    # tokenizer = AutoTokenizer.from_pretrained('GSAI-ML/LLaDA-8B-Instruct', trust_remote_code = True)
     model = AutoModelForMaskedLM.from_pretrained('kuleshov-group/mdlm-owt', trust_remote_code = True)
     tokenizer = transformers.AutoTokenizer.from_pretrained('gpt2', trust_remote_code = True)
     optimizer = AdamW(model.parameters(), lr=float(config['learning_rate']))
