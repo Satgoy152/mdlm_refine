@@ -1,4 +1,4 @@
-from transformers import AutoModelForCausalLM, AutoTokenizer, AutoModelForMaskedLM
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoModelForMaskedLM, get_linear_schedule_with_warmup
 import transformers
 from torch.optim import AdamW
 import torch
@@ -22,6 +22,11 @@ def initialize(config):
     model = AutoModelForMaskedLM.from_pretrained('kuleshov-group/mdlm-owt', trust_remote_code = True)
     tokenizer = transformers.AutoTokenizer.from_pretrained('gpt2', trust_remote_code = True)
     optimizer = AdamW(model.parameters(), lr=float(config['learning_rate']))
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer, 
+        num_warmup_steps=500, 
+        num_training_steps=config['max_steps']
+    )
 
 
     wandb.init(
@@ -36,9 +41,9 @@ def initialize(config):
         }
     )
 
-    dataset = load_dataset(config['dataset'], streaming = True, split = "train")
+    dataset = load_dataset(config['dataset'], "en" ,streaming = True, split = "train")
 
-    return model, tokenizer, optimizer, dataset
+    return model, tokenizer, optimizer, dataset, scheduler
 
 
 # helpers
@@ -66,7 +71,7 @@ def remask_tokens(logits, sampled_tokens, mask, output_starts, remask_ratio, mas
         confidence = sampled_probs.clone()
         
         for b, output_start in enumerate(output_starts):
-            confidence[b, :output_start] = float('inf')
+            # confidence[b, :output_start] = float('inf')
             confidence[b, mask[b] == False] = float('inf')
 
         masked_tokens = sampled_tokens.clone()
@@ -75,7 +80,8 @@ def remask_tokens(logits, sampled_tokens, mask, output_starts, remask_ratio, mas
             remask_ratio = torch.rand(1).item()
 
         for b, output_start in enumerate(output_starts):
-            num_to_mask = int(remask_ratio * (mask[b, output_start:].sum().item()))
+            # num_to_mask = int(remask_ratio * (mask[b, output_start:].sum().item()))
+            num_to_mask = int(remask_ratio * (mask[b, :].sum().item()))
             _, lowest_conf_idx = torch.topk(confidence[b], k=num_to_mask, largest=False)
             masked_tokens[b, lowest_conf_idx] = mask_token_id
         
@@ -99,7 +105,7 @@ def calculate_loss(loss_1, loss_2, method = "alpha", a = 0.5):
         return (a * loss_1) + ((1 - a) * loss_2)
 
 # training loop
-def train_loop(model, tokenizer, optimizer, dataset, config, device):
+def train_loop(model, tokenizer, optimizer, dataset, config, scheduler, device):
     MASK_TOKEN_ID = tokenizer.vocab_size
 
     print("Pad token:", tokenizer.pad_token_id)
@@ -130,15 +136,14 @@ def train_loop(model, tokenizer, optimizer, dataset, config, device):
         all_tokens = []
         all_output_starts = []
         for ex in batch:
-            inst = ex['instruction']
-            output =  ex["output"]
+            inst = ex['text']
             
             #tokenize
             inst_tokens = tokenizer(inst, return_tensors = "pt", truncation = True, max_length = 512).input_ids
-            output_tokens = tokenizer(output, return_tensors = "pt", truncation = True, max_length = 512).input_ids
+            # output_tokens = tokenizer(output, return_tensors = "pt", truncation = True, max_length = 512).input_ids
 
             # full model input
-            tokens = torch.cat([inst_tokens, output_tokens], dim = 1)
+            tokens = torch.cat([inst_tokens], dim = 1)
             all_tokens.append(tokens.squeeze(0))
 
             output_start = inst_tokens.shape[1]
@@ -160,7 +165,8 @@ def train_loop(model, tokenizer, optimizer, dataset, config, device):
                mask_rate = torch.rand(1).item()
             else:
                 mask_rate = config["mask_ratio"]
-            mask[b, output_start:] = torch.rand(tokens[b, output_start:].shape) < mask_rate
+            # mask[b, output_start:] = torch.rand(tokens[b, output_start:].shape) < mask_rate
+            mask[b, :] = torch.rand(tokens[b, :].shape) < mask_rate
 
         masked_tokens = tokens.clone()
         # apply mask
@@ -191,7 +197,8 @@ def train_loop(model, tokenizer, optimizer, dataset, config, device):
 
         output_mask = torch.zeros_like(tokens, dtype=torch.bool)
         for b, start in enumerate(all_output_starts):
-            output_mask[b, start:] = True
+            # output_mask[b, start:] = True
+            output_mask[b, :] = True
         unmasked_output = ((output_mask & ~mask) & ~pad_mask)
         unmasked_entropy_1 = entropy_1[unmasked_output].mean().item() if unmasked_output.any() else 0.0 
 
@@ -200,8 +207,8 @@ def train_loop(model, tokenizer, optimizer, dataset, config, device):
         logits_with_noise = add_gumbel_noise(logits_1.detach(), temperature = temperature)
         sampled_tokens = torch.argmax(logits_with_noise, dim=-1)
         # reset prompt
-        for b, start in enumerate(all_output_starts):
-            sampled_tokens[b, :start] = tokens[b, :start]
+        # for b, start in enumerate(all_output_starts):
+        #     sampled_tokens[b, :start] = tokens[b, :start]
 
         # remask
         masked_tokens = remask_tokens(logits_1, sampled_tokens, mask, all_output_starts, remask_ratio, MASK_TOKEN_ID)
@@ -226,6 +233,7 @@ def train_loop(model, tokenizer, optimizer, dataset, config, device):
         loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
+        scheduler.step()
         optimizer.zero_grad()
 
         with torch.no_grad():
@@ -255,6 +263,8 @@ def train_loop(model, tokenizer, optimizer, dataset, config, device):
         })
 
         batch = []  # reset batch
+        if i >= config['max_steps']:
+            break
     
     wandb.finish()
     torch.cuda.empty_cache()
@@ -272,7 +282,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     config = load_config(args.config_path)
     print("Config loaded from", args.config_path)
-    model, tokenizer, optimizer, dataset = initialize(config)
+    model, tokenizer, optimizer, dataset, scheduler = initialize(config)
     tokenizer.pad_token = tokenizer.eos_token
     print("Initialization done.")
     # print("Model, optimizer, and dataset prepared.")
@@ -282,7 +292,7 @@ if __name__ == "__main__":
     print("Starting training loop...")
     # print(f"Tokenizer mask: {tokenizer.mask_token_id}")
     
-    train_loop(model, tokenizer, optimizer, dataset, config, device=device)
+    train_loop(model, tokenizer, optimizer, dataset, config, scheduler, device=device)
 
     print("Training completed. Saving model...")
     save_model(model, save_path = "./finetuned_llada")
