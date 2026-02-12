@@ -211,6 +211,7 @@ def train_loop(model, tokenizer, optimizer, dataset, config, scheduler, device):
         #     sampled_tokens[b, :start] = tokens[b, :start]
 
         # remask
+        remask_ratio = mask_rate
         masked_tokens = remask_tokens(logits_1, sampled_tokens, mask, all_output_starts, remask_ratio, MASK_TOKEN_ID)
 
         # STEP 2: send through the model
@@ -231,10 +232,14 @@ def train_loop(model, tokenizer, optimizer, dataset, config, scheduler, device):
         loss = calculate_loss(loss_1, loss_2, method = "alpha", a = alpha)
         # backprop
         loss.backward()
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
-        scheduler.step()
-        optimizer.zero_grad()
+
+        accum_steps = config['accum_steps']
+        # gradient accum:
+        if (i + 1) % accum_steps == 0:
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
 
         with torch.no_grad():
             pred_2 = torch.argmax(logits_2, dim=-1)
