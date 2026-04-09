@@ -148,6 +148,36 @@ This loads samples from `save_gen_dir` using the same `{model}_{sampler}_steps{s
 
 ---
 
+## Sweeping correction_ratio and fill_ratio
+
+The script `slurm/sweep_cr_fr.sh` is meant for the two-phase sampling method where the first part of the NFE budget (number of model passes) is used for pure standard diffusion generation, and the remainder is used for diffusion + correction.
+
+The two parameters being swept:
+
+- `--correction_ratio` — controls the split between pure diffusion and diffusion+correction phases. E.g. `0.75` means 25% of steps are pure DDPM, 75% include correction.
+- `--fill_ratio` — fraction of masked positions to stochastically fill before the correction pass.
+
+The script loops over all combinations and collects `gen_ppl`, `entropy`, and `rep_n` into a CSV.
+
+### Usage
+
+Edit the values at the top of the script:
+
+```bash
+CORRECTION_RATIOS="0.75"
+FILL_RATIOS="0.25 0.5 0.75 1.0"
+```
+
+Then submit:
+
+```bash
+sbatch slurm/sweep_cr_fr.sh
+```
+
+Results are saved to `./sweep_results/sweep_0.75_fr.csv` with columns: `correction_ratio,fill_ratio,gen_ppl,entropy,rep_n`. Each combination also saves its full results JSON to `./eval_results/cr{CR}_fr{FR}/`.
+
+---
+
 ## eval_reconstruct.py
 
 Diagnostic tool for testing whether a model can reconstruct masked/corrupted text. Uses the same model checkpoints as `model_eval.py` and provides reconstruction-adapted versions of all samplers.

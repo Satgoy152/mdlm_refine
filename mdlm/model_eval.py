@@ -949,7 +949,15 @@ def compute_lm_judge(texts: list[str], config_key: str,
             "contents": [{"parts": [{"text": prompt}], "role": "user"}]
         })
 
-    client = genai.Client(api_key='AIzaSyClMl5KCmlifid5zBxjBLgA4ihHoZnTHhc')
+    from dotenv import load_dotenv
+    import os
+
+
+    load_dotenv()
+    gemini_api_key = os.getenv("GEMINI_API_KEY")
+
+
+    client = genai.Client(api_key=gemini_api_key)
     job = client.batches.create(
         model="gemini-2.5-flash",
         src=requests,
