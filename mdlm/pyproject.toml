@@ -1,0 +1,10 @@
+[project]
+name = "mdlm"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy==1.26.4",
+    "setuptools==66.1.1",
+]

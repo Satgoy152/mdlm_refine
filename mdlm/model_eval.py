@@ -1,0 +1,1427 @@
+#!/usr/bin/env python3
+"""model_eval.py — Unified MDLM model evaluation harness.
+
+Loops over all combinations of model, sampler, and num_steps,
+generates samples, and computes requested metrics.
+
+Usage:
+  python model_eval.py \\
+    --models vanilla refine \\
+    --samplers vanilla refine proseco \\
+    --num_samples 128 \\
+    --num_steps 5 120 1024 \\
+    --gen_len 1024 \\
+    --metrics gen_ppl \\
+    --gen_model gpt2 llama3b \\
+    --save_gen_dir ./samples \\
+    --save_res_dir ./results \\
+    --proseco_budget 3 \\
+    --proseco_freq 1 \\
+    --eval_batch_size 16
+"""
+
+from __future__ import annotations
+
+import argparse
+import itertools
+import json
+import math
+import os
+import random
+import sys
+from datetime import datetime
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import torch
+from tqdm import tqdm
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+
+import omegaconf
+# _register_resolvers()
+
+
+
+# ── Hardcoded checkpoint paths (edit before use) ──────────────────────────────
+
+CHECKPOINTS = {
+    'vanilla': '/nfs/turbo/coe-jjparkcv-medium/satyam/mdlm/checkpoints/vanilla/checkpoints/last.ckpt',
+    'refine':  '/nfs/turbo/coe-jjparkcv-medium/satyam/mdlm/checkpoints/refine/checkpoints/best.ckpt',
+    'proseco': '/nfs/turbo/coe-jjparkcv-medium/satyam/mdlm/checkpoints/proseco/best-v1.ckpt',
+}
+
+GEN_PPL_MODELS = {
+    'gpt2':    'gpt2',
+    'llama3b': 'meta-llama/Llama-3.2-3B',
+    'llama1b': 'meta-llama/Llama-3.2-1B',
+}
+
+# ── OmegaConf resolvers ───────────────────────────────────────────────────────
+
+def _register_resolvers():
+    for name, fn in [
+        ('cwd',          os.getcwd),
+        ('device_count', lambda: torch.cuda.device_count()),
+        ('eval',         eval),
+        ('div_up',       lambda x, y: (x + y - 1) // y),
+    ]:
+        try:
+            omegaconf.OmegaConf.register_new_resolver(name, fn)
+        except Exception:
+            pass
+
+# ── Model loading ─────────────────────────────────────────────────────────────
+
+def load_mdlm(model_name: str, device: str):
+    ckpt_path = CHECKPOINTS[model_name]
+    raw = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+    config = raw['hyper_parameters']['config']
+    if not isinstance(config, omegaconf.DictConfig):
+        config = omegaconf.OmegaConf.create(config)
+    with omegaconf.open_dict(config):
+        config.trainer.num_nodes = 1
+        config.trainer.devices = 1
+        config.trainer.accumulate_grad_batches = 1
+
+    tokenizer = dataloader.get_tokenizer(config)
+    model = diffusion_module.Diffusion.load_from_checkpoint(
+        ckpt_path, tokenizer=tokenizer, config=config, map_location=device)
+    model.to(device).eval()
+
+    if model.ema is not None:
+        params = lambda: itertools.chain(
+            model.backbone.parameters(), model.noise.parameters())
+        model.ema.store(params())
+        model.ema.copy_to(params())
+
+    return model
+
+# ── Samplers ──────────────────────────────────────────────────────────────────
+
+@torch.no_grad()
+def sample_vanilla(model, n_samples: int, steps: int, gen_len: int,
+                   device: str, eps: float = 1e-5, **_):
+    """Vanilla MDLM ancestral sampler using DDPM updates."""
+    x = model._sample_prior(n_samples, gen_len).to(device)
+    timesteps = torch.linspace(1, eps, steps + 1, device=device)
+    dt = (1 - eps) / steps
+
+    for i in range(steps):
+        t = timesteps[i] * torch.ones(n_samples, 1, device=device)
+        x = model._ddpm_update(x, t, dt)
+
+    # Final noise removal: one forward pass, argmax over vocab
+    t_final = timesteps[-1] * torch.ones(n_samples, 1, device=device)
+    unet_conditioning = model.noise(t_final)[0]
+    x = model.forward(x, unet_conditioning).argmax(dim=-1)
+    return x
+
+
+@torch.no_grad()
+def _sample_refine_confidence(model, n_samples: int, steps: int, gen_len: int,
+                  device: str, temperature: float = 0.5, **_):
+    """DEPRECATED: Confidence-based iterative sampler (kept for reference, not in SAMPLERS).
+
+    This sampler is designed for the "refine" MDLM variant. During training,
+    the refine model does a two-pass procedure:
+      1. Given a masked input at noise level t, it predicts all tokens (standard
+         MDLM denoising). A subset of its own predictions are sampled and kept
+         as unmasked, simulating what happens at inference time.
+      2. The model runs a second forward pass on this partially-filled sequence
+         (which contains its own potentially-wrong predictions as unmasked tokens)
+         and is trained to correct them via cross-entropy against ground truth.
+
+    Unlike vanilla MDLMs — which assume all unmasked tokens are ground truth
+    (because they are during training) — the refine model has learned that
+    unmasked tokens may be its own errors and should be revisited. This matches
+    inference reality where every unmasked token was generated by the model.
+
+    At inference time we exploit this by running a two-phase update each step:
+      Phase 1 (unmask):  Pick the k most confident masked positions (via Gumbel
+                         noise for stochasticity) and fill them with sampled tokens.
+      Phase 2 (correct): Among already-unmasked positions, find those where the
+                         model wants to change the token (argmax != current).
+                         Rank by confidence ratio log p(new)/p(current) and accept
+                         the top-k corrections deterministically (no noise).
+
+    Each step:
+      k_unmask  = gen_len // steps  (last step drains all remaining masks)
+      k_correct = min(k_unmask, number of currently unmasked positions)
+    """
+    mask_idx = model.mask_index
+    eps = 1e-5
+    # How many masks to reveal per step. Since we start fully masked
+    # (n_init_masked == gen_len), this equals gen_len // steps.
+    k_per_step = max(gen_len // steps, 1)
+
+    # Start from a fully masked sequence: every position is the mask token.
+    x = model._sample_prior(n_samples, gen_len).to(device)  # [B, L], all mask_idx
+
+    # Same timestep schedule as vanilla MDLM: walk t from 1 → eps over `steps` steps.
+    # This gives the model the correct noise-level conditioning at each step,
+    # matching what it saw during training.
+    timesteps = torch.linspace(1, eps, steps + 1, device=device)
+
+    for step in range(steps):
+        # ── Compute sigma for this timestep ──────────────────────────────
+        # t tells us where we are in the diffusion schedule; sigma = noise(t)
+        # is the actual conditioning value the backbone expects via adaLN.
+        t = timesteps[step] * torch.ones(n_samples, 1, device=device)
+        sigma = model.noise(t)[0]  # [B, 1] → will be squeezed by _process_sigma
+    
+        # ── Forward pass: get raw logits from the backbone ───────────────
+        # We call backbone directly (not model.forward) to bypass the SUBS
+        # parameterization, which would force unmasked positions to be one-hot
+        # and prevent the model from proposing corrections at those positions.
+        with torch.cuda.amp.autocast(dtype=torch.float32):
+            logits = model.backbone(x, model._process_sigma(sigma))  # [B, L, V]
+
+        # Set logit for the mask token to -inf so the model never "predicts"
+        # the mask token itself, then normalise to proper log-probabilities.
+        logits[:, :, mask_idx] += model.neg_infinity
+        log_probs = logits - torch.logsumexp(logits, dim=-1, keepdim=True)  # [B, L, V]
+
+        # ── Deterministic candidates (for correction — no noise) ─────────
+        # At each position, what would the model predict without any noise?
+        det_candidates = log_probs.argmax(dim=-1)  # [B, L]
+
+        # ── Gumbel-noised candidates (for unmasking — stochastic) ────────
+        # Gumbel-max trick: sample from the categorical distribution defined
+        # by the model's probabilities. probs / gumbel_noise is equivalent to
+        # adding Gumbel noise to log-probs and taking argmax.
+        # The temperature controls diversity: higher temp = more random.
+        if temperature > 0:
+            probs = log_probs.exp().to(torch.float64)
+            gumbel_noise = (-torch.log(torch.rand_like(probs))) ** temperature
+            gumbel_probs = probs / gumbel_noise                     # [B, L, V]
+            gumbel_candidates = gumbel_probs.argmax(dim=-1).long()  # [B, L]
+            # Confidence = max Gumbel-noised prob at each position. Higher means
+            # the model is more sure about its prediction even after noise.
+            gumbel_confidence = gumbel_probs.max(dim=-1).values     # [B, L]
+        else:
+            # temperature=0: fully deterministic, no noise at all
+            gumbel_candidates = det_candidates
+            gumbel_confidence = log_probs.max(dim=-1).values
+
+        new_x = x.clone()
+        for b in range(n_samples):
+            n_masked_now = int((x[b] == mask_idx).sum().item())
+
+            # Schedule: unmask k tokens per step, drain everything on last step
+            if step == steps - 1:
+                n_to_unmask = n_masked_now
+            else:
+                n_to_unmask = min(k_per_step, n_masked_now)
+
+            # ── Phase 1: Unmask top-k masked positions by Gumbel confidence ──
+            # Find all currently masked positions, rank by how confident the
+            # model is (after Gumbel noise), and unmask the top-k.
+            unmask_mask = torch.zeros(gen_len, dtype=torch.bool, device=device)
+            if n_to_unmask > 0:
+                masked_pos = (x[b] == mask_idx).nonzero(as_tuple=True)[0]   # indices of masked positions
+                conf_masked = gumbel_confidence[b][masked_pos]              # their Gumbel confidences
+                k = min(n_to_unmask, masked_pos.numel())
+                _, top_rel = conf_masked.topk(k, largest=True)              # pick the k most confident
+                unmask_mask[masked_pos[top_rel]] = True                     # mark them for unmasking
+
+            # ── Phase 2: Correct top-k unmasked positions by confidence ratio ─
+            # The refine model can revise its own past predictions. We look at
+            # all currently unmasked positions and check: does the model now
+            # prefer a different token than what's there?
+            n_unmasked = int((x[b] != mask_idx).sum().item())
+            # Cap corrections at min(k_unmask, n_unmasked) — can't correct more
+            # positions than exist, and we don't want to correct more than we unmask.
+            n_to_correct = min(n_to_unmask, n_unmasked)
+            n_to_correct = 0
+
+            correct_mask = torch.zeros(gen_len, dtype=torch.bool, device=device)
+            if n_to_correct > 0:
+                unmasked_pos = (x[b] != mask_idx).nonzero(as_tuple=True)[0]
+
+                # Filter: only consider positions where model's argmax differs
+                # from the current token (no point "correcting" to the same thing).
+                changed = det_candidates[b][unmasked_pos] != x[b][unmasked_pos]
+                cand_pos = unmasked_pos[changed]  # positions where model disagrees
+
+                if cand_pos.numel() > 0:
+                    k_corr = min(n_to_correct, cand_pos.numel())
+                    # Confidence ratio: how much more does the model like the new
+                    # token vs the current one? log p(new) - log p(current).
+                    # Positive ratio = model prefers the swap.
+                    log_p_new = log_probs[b][cand_pos, det_candidates[b][cand_pos]]
+                    log_p_cur = log_probs[b][cand_pos, x[b][cand_pos]]
+                    log_ratio = log_p_new - log_p_cur
+                    # Take the top-k corrections ranked by this ratio
+                    _, top_rel = log_ratio.topk(k_corr, largest=True)
+                    correct_mask[cand_pos[top_rel]] = True
+
+            # ── Apply updates ────────────────────────────────────────────────
+            # Newly unmasked positions get the stochastic Gumbel sample;
+            # corrected positions get the deterministic argmax (no noise).
+            update_mask = unmask_mask | correct_mask
+            tokens_to_write = torch.where(unmask_mask, gumbel_candidates[b], det_candidates[b])
+            # Only overwrite positions that are in update_mask; leave the rest unchanged.
+            new_x[b] = torch.where(update_mask, tokens_to_write, x[b])
+
+        x = new_x
+
+    return x
+
+
+# @torch.no_grad()
+# def sample_refine_ddpm(model, n_samples: int, steps: int, gen_len: int,
+#                        device: str, n_correct_per_step: int = 10, **_):
+#     """DDPM unmasking + remask-based correction sampler for refine MDLM.
+
+#     Phase 1 (unmask): Standard DDPM reverse step — identical to vanilla.
+
+#     Phase 2 (correct): Pick k unmasked positions to revisit by temporarily
+#     remasking them, then run model.forward() (with SUBS) so the model
+#     predicts at those masked positions using surrounding context (which
+#     includes its own potentially-wrong tokens). Accept the prediction if
+#     the model prefers a different token with high confidence.
+
+#     This mirrors refine training: the model sees its own outputs as
+#     unmasked context and predicts at masked positions.
+
+#     Args:
+#         n_correct_per_step: max corrections per step (0 = vanilla-only)
+#     """
+#     mask_idx = model.mask_index
+#     eps = 1e-5
+
+#     x = model._sample_prior(n_samples, gen_len).to(device)
+#     timesteps = torch.linspace(1, eps, steps + 1, device=device)
+#     dt = (1 - eps) / steps
+
+#     for i in range(steps):
+#         t = timesteps[i] * torch.ones(n_samples, 1, device=device)
+
+#         # ── Phase 1: Standard DDPM unmasking (same as vanilla) ───────────
+#         x = model._ddpm_update(x, t, dt)
+
+#         # ── Phase 2: Remask-based correction ─────────────────────────────
+#         if n_correct_per_step > 0:
+#             # Use sigma_s (post-step noise level) for conditioning
+#             sigma_s = model.noise(t - dt)[0]
+
+#             for b in range(n_samples):
+#                 unmasked_pos = (x[b] != mask_idx).nonzero(as_tuple=True)[0]
+#                 if unmasked_pos.numel() == 0:
+#                     continue
+
+#                 k = min(n_correct_per_step, unmasked_pos.numel())
+#                 # Randomly pick k unmasked positions to revisit
+#                 perm = torch.randperm(unmasked_pos.numel(), device=device)[:k]
+#                 revisit_pos = unmasked_pos[perm]
+
+#                 # Save current tokens, remask those positions
+#                 saved_tokens = x[b, revisit_pos].clone()
+#                 x[b, revisit_pos] = mask_idx
+
+#                 # Forward with SUBS: model predicts at remasked positions
+#                 # using surrounding (potentially wrong) context
+#                 x_input = x[b:b+1]  # [1, L]
+#                 sigma_b = sigma_s[b:b+1]  # [1, 1]
+#                 log_probs = model.forward(x_input, sigma_b)  # [1, L, V]
+
+#                 # Get model's prediction at the revisited positions
+#                 new_tokens = log_probs[0, revisit_pos].argmax(dim=-1)
+#                 confidence = log_probs[0, revisit_pos].max(dim=-1).values
+
+#                 # Accept if model is confident (log_prob > threshold)
+#                 # and predicts something different
+#                 changed = new_tokens != saved_tokens
+#                 accept = changed & (confidence > torch.log(torch.tensor(0.5, device=device)))
+
+#                 # Restore saved tokens, then overwrite accepted corrections
+#                 x[b, revisit_pos] = saved_tokens
+#                 if accept.any():
+#                     x[b, revisit_pos[accept]] = new_tokens[accept]
+
+#     # Final noise removal
+#     t_final = timesteps[-1] * torch.ones(n_samples, 1, device=device)
+#     unet_conditioning = model.noise(t_final)[0]
+#     x = model.forward(x, unet_conditioning).argmax(dim=-1)
+
+#     return x
+
+
+@torch.no_grad()
+def _sample_refine_ddpm(model, n_samples: int, steps: int, gen_len: int,
+                               device: str, n_correct_per_step: int = 100, **_):
+    """DEPRECATED: Two-pass version (not in SAMPLERS). Use sample_refine instead."""
+    mask_idx = model.mask_index
+    eps = 1e-5
+
+    x = model._sample_prior(n_samples, gen_len).to(device)
+    timesteps = torch.linspace(1, eps, steps + 1, device=device)
+    dt = (1 - eps) / steps
+
+    for i in range(steps):
+        t = timesteps[i] * torch.ones(n_samples, 1, device=device)
+
+        # Phase 1: Standard DDPM unmasking (same as vanilla)
+        x = model._ddpm_update(x, t, dt)
+
+        # Phase 2: Bounded correction of unmasked positions
+        if n_correct_per_step > 0:
+            sigma_s = model.noise(t - dt)[0]
+            sigma = model._process_sigma(sigma_s)
+            with torch.cuda.amp.autocast(dtype=torch.float32):
+                logits = model.backbone(x, sigma)
+            logits[:, :, mask_idx] += model.neg_infinity
+            log_probs = logits - torch.logsumexp(logits, dim=-1, keepdim=True)
+            det_candidates = log_probs.argmax(dim=-1)
+
+            for b in range(n_samples):
+                unmasked_pos = (x[b] != mask_idx).nonzero(as_tuple=True)[0]
+                if unmasked_pos.numel() == 0:
+                    continue
+                changed = det_candidates[b][unmasked_pos] != x[b][unmasked_pos]
+                cand_pos = unmasked_pos[changed]
+                if cand_pos.numel() == 0:
+                    continue
+                k = min(n_correct_per_step, cand_pos.numel())
+                log_p_new = log_probs[b][cand_pos, det_candidates[b][cand_pos]]
+                log_p_cur = log_probs[b][cand_pos, x[b][cand_pos]]
+                _, top_idx = (log_p_new - log_p_cur).topk(k, largest=True)
+                x[b, cand_pos[top_idx]] = det_candidates[b, cand_pos[top_idx]]
+
+    # Final noise removal
+    t_final = timesteps[-1] * torch.ones(n_samples, 1, device=device)
+    unet_conditioning = model.noise(t_final)[0]
+    x = model.forward(x, unet_conditioning).argmax(dim=-1)
+
+    return x
+
+
+@torch.no_grad()
+def _select_corrector_tokens(log_x_theta, corrector_x, method='argmax'):
+    """Select tokens from corrector logits using the specified method.
+
+    Args:
+        log_x_theta: Log-probabilities of shape (batch, seq_len, vocab_size).
+        corrector_x: Current corrector tokens of shape (batch, seq_len).
+        method: 'argmax' — update all positions with argmax tokens.
+                'topk'   — take argmax at every position, but only apply
+                           at the k=100 positions with highest argmax
+                           confidence; other positions keep their value
+                           from corrector_x.
+    """
+    if method == 'argmax':
+        return log_x_theta.argmax(dim=-1)
+    elif method == 'topk':
+        k = 100
+        argmax_tokens = log_x_theta.argmax(dim=-1)             # (batch, seq_len)
+        argmax_conf = log_x_theta.max(dim=-1).values            # (batch, seq_len)
+        # Algorithm 5: zero out confidence where output == input
+        # so only positions where the corrector *changed* the token compete
+        unchanged = (argmax_tokens == corrector_x)
+        argmax_conf = argmax_conf.masked_fill(unchanged, float('-inf'))
+        seq_len = argmax_conf.shape[-1]
+        k_clamped = min(k, seq_len)
+        # Indices of top-k most confident *changed* positions per batch element
+        _, topk_pos = argmax_conf.topk(k_clamped, dim=-1)       # (batch, k)
+        mask = torch.zeros_like(argmax_conf, dtype=torch.bool)
+        mask.scatter_(-1, topk_pos, True)
+        return torch.where(mask, argmax_tokens, corrector_x)
+    else:
+        raise ValueError(f"Unknown corrector_sampling method: {method}")
+
+
+def sample_proseco(model, n_samples: int, steps: int, gen_len: int,
+                   device: str, proseco_budget: int, proseco_freq: int,
+                   corrector_sampling: str = 'argmax', **_):
+    """ProSeCo sampler: MDLM unmasking with periodic self-correction.
+
+    The total NFE budget is `steps`. Each outer unmasking step costs 1 NFE,
+    and every `proseco_freq` outer steps we run `proseco_budget` corrector
+    passes (each costing 1 NFE). We compute the number of actual outer
+    steps so that total NFEs ≈ `steps`.
+
+    Args:
+        proseco_budget: S — number of corrector forward passes per correction round.
+        proseco_freq:   omega — run the corrector every omega outer steps.
+    """
+    mask_idx = model.mask_index
+    eps = 1e-5
+
+    # Budget accounting: over every `omega` outer steps we spend
+    # `omega` (MDLM) + S (corrector) = omega + S NFEs.
+    # So actual_outer_steps = steps * omega / (omega + S).
+    omega = proseco_freq
+    S = proseco_budget
+    actual_steps = int(steps / (1 + (S / omega)))
+    actual_steps = max(actual_steps, 1)
+
+    # Start fully masked
+    x = model._sample_prior(n_samples, gen_len).to(device)
+    timesteps = torch.linspace(1, eps, actual_steps + 1, device=device)
+    dt = (1 - eps) / actual_steps
+
+    for i in range(actual_steps):
+        t = timesteps[i] * torch.ones(n_samples, 1, device=device)
+
+        # ── Step 2: MDLM forward pass (unmasking prediction) ─────────
+        sigma_t, _ = model.noise(t)
+        sigma_s, _ = model.noise(t - dt)
+        if sigma_t.ndim > 1:
+            sigma_t = sigma_t.squeeze(-1)
+        if sigma_s.ndim > 1:
+            sigma_s = sigma_s.squeeze(-1)
+        move_chance_t = (1 - torch.exp(-sigma_t))[:, None, None]
+        move_chance_s = (1 - torch.exp(-sigma_s))[:, None, None]
+
+        log_x_theta = model.forward(x, sigma_t)
+        use_f64 = getattr(model.config, 'sampling', None) and \
+            getattr(model.config.sampling, 'use_float64', False)
+        if use_f64:
+            log_x_theta = log_x_theta.to(torch.float64)
+
+        # ── Step 3: ProSeCo corrector (every omega steps) ────────────
+        if (i + 1) % omega == 0:
+            # Create dense corrector input via argmax (no masks)
+            corrector_x = log_x_theta.argmax(dim=-1)
+
+            # Iterative refinement: S corrector passes
+            for _s in range(S):
+                sigma = model._process_sigma(sigma_t)
+                with torch.cuda.amp.autocast(dtype=torch.float32):
+                    corrector_logits = model.backbone(corrector_x, sigma)
+                corrector_logits[..., mask_idx] += model.neg_infinity
+                corrector_log_x_theta = corrector_logits.log_softmax(dim=-1)
+                if use_f64:
+                    corrector_log_x_theta = corrector_log_x_theta.to(torch.float64)
+                corrector_x = _select_corrector_tokens(corrector_log_x_theta, corrector_x, corrector_sampling)
+
+            # Apply corrections: overwrite already-unmasked positions
+            # with the corrector's refined tokens
+            unmasked = (x != mask_idx)
+            x = torch.where(unmasked, corrector_x, x)
+
+            # Use the corrector's refined logits for posterior sampling
+            log_x_theta = corrector_log_x_theta
+
+        # ── Step 4: DDPM posterior sampling (unmask new tokens) ───────
+        x_theta = log_x_theta.exp()
+        q_xs = x_theta * (move_chance_t - move_chance_s)
+        q_xs[:, :, mask_idx] = move_chance_s[:, :, 0]
+        _x = _sample_categorical(q_xs)
+
+        copy_flag = (x != mask_idx)
+        x = torch.where(copy_flag, x, _x)
+
+    # Final denoising pass
+    t_final = timesteps[-1] * torch.ones(n_samples, 1, device=device)
+    unet_conditioning = model.noise(t_final)[0]
+    x = model.forward(x, unet_conditioning).argmax(dim=-1)
+
+    return x
+
+
+@torch.no_grad()
+def sample_proseco_m(model, n_samples: int, steps: int, gen_len: int,
+                     device: str, proseco_budget: int, proseco_freq: int,
+                     corrector_sampling: str = 'argmax', **_):
+    """ProSeCo-M sampler: correction phase sees masked + unmasked tokens.
+
+    Like sample_proseco, but during the corrector phase the model receives
+    the current sequence `x` (which still contains mask tokens) instead of
+    a fully dense argmax sequence. At each corrector pass, only the
+    unmasked positions are overwritten with the corrector's refined tokens;
+    masked positions stay masked. The refined logits are then used for
+    posterior sampling.
+
+    Args:
+        proseco_budget: S — number of corrector forward passes per correction round.
+        proseco_freq:   omega — run the corrector every omega outer steps.
+    """
+    mask_idx = model.mask_index
+    eps = 1e-5
+
+    omega = proseco_freq
+    S = proseco_budget
+    actual_steps = int(steps / (1 + (S / omega)))
+    actual_steps = max(actual_steps, 1)
+
+    # Start fully masked
+    x = model._sample_prior(n_samples, gen_len).to(device)
+    timesteps = torch.linspace(1, eps, actual_steps + 1, device=device)
+    dt = (1 - eps) / actual_steps
+
+    for i in range(actual_steps):
+        t = timesteps[i] * torch.ones(n_samples, 1, device=device)
+
+        # ── MDLM forward pass (unmasking prediction) ─────────────────
+        sigma_t, _ = model.noise(t)
+        sigma_s, _ = model.noise(t - dt)
+        if sigma_t.ndim > 1:
+            sigma_t = sigma_t.squeeze(-1)
+        if sigma_s.ndim > 1:
+            sigma_s = sigma_s.squeeze(-1)
+        move_chance_t = (1 - torch.exp(-sigma_t))[:, None, None]
+        move_chance_s = (1 - torch.exp(-sigma_s))[:, None, None]
+
+        log_x_theta = model.forward(x, sigma_t)
+        use_f64 = getattr(model.config, 'sampling', None) and \
+            getattr(model.config.sampling, 'use_float64', False)
+        if use_f64:
+            log_x_theta = log_x_theta.to(torch.float64)
+
+        # ── ProSeCo-M corrector (every omega steps) ──────────────────
+        if (i + 1) % omega == 0:
+            # Start from current x (contains both masked and unmasked tokens)
+            corrector_x = x.clone()
+
+            # Overwrite unmasked positions with MDLM predictions
+            unmasked = (x != mask_idx)
+            # corrector_x = torch.where(unmasked, log_x_theta.argmax(dim=-1), corrector_x)
+
+            # Iterative refinement: S corrector passes
+            for _s in range(S):
+                sigma = model._process_sigma(sigma_t)
+                with torch.cuda.amp.autocast(dtype=torch.float32):
+                    corrector_logits = model.backbone(corrector_x, sigma)
+                corrector_logits[..., mask_idx] += model.neg_infinity
+                corrector_log_x_theta = corrector_logits.log_softmax(dim=-1)
+                if use_f64:
+                    corrector_log_x_theta = corrector_log_x_theta.to(torch.float64)
+                # Overwrite only unmasked positions where model predicts a different token
+                argmax_tokens = corrector_log_x_theta.argmax(dim=-1)
+                argmax_conf = corrector_log_x_theta.max(dim=-1).values
+                changed = (argmax_tokens != corrector_x)
+                eligible = unmasked & changed
+                argmax_conf = torch.where(eligible, argmax_conf, torch.tensor(float('-inf'), device=argmax_conf.device))
+                k = min(10, eligible.sum(dim=-1).min().item())
+                if k > 0:
+                    _, topk_pos = argmax_conf.topk(k, dim=-1)
+                    topk_mask = torch.zeros_like(eligible)
+                    topk_mask.scatter_(-1, topk_pos, True)
+                    corrector_x = torch.where(topk_mask, argmax_tokens, corrector_x)
+
+            # Apply corrections to x: overwrite unmasked positions
+            x = torch.where(unmasked, corrector_x, x)
+
+            # Use the corrector's refined logits for posterior sampling
+            log_x_theta = corrector_log_x_theta
+
+        # ── DDPM posterior sampling (unmask new tokens) ───────────────
+        x_theta = log_x_theta.exp()
+        q_xs = x_theta * (move_chance_t - move_chance_s)
+        q_xs[:, :, mask_idx] = move_chance_s[:, :, 0]
+        _x = _sample_categorical(q_xs)
+
+        copy_flag = (x != mask_idx)
+        x = torch.where(copy_flag, x, _x)
+
+    return x
+    
+@torch.no_grad()
+def sample_refine_v2(model, n_samples: int, steps: int, gen_len: int,
+                                        device: str, n_correct_per_step: int = 50,
+                                        correct_mode: str = 'topk',
+                                        correct_threshold: float = 0.01,
+                                        correction_ratio: float = 1.0,
+                                        fill_ratio: float = 0.75, **_):
+    """
+    Stochastic Backloaded Refine Sampler.
+    1. Dedicates the first 50% of the NFE budget purely to DDPM unmasking to build structure.
+    2. In the second half, introduces correction passes using a *stochastically* filled 
+       dense context to prevent mode collapse ("long, long" loops) while maximizing reach.
+    """
+    # --- Adaptive NFE Allocation ---
+    # Total NFEs = L_pure + 2 * L_corr. We want L_pure approx equal to L_corr.
+    # Total NFEs = 1.5 * L  -> L = Total NFEs / 1.5
+    L = int(steps / (1 + correction_ratio))
+    L_pure = int(L * (1 - correction_ratio))
+    effective_steps = L
+    
+    print(f"Stochastic Backloaded Refine: {steps} NFEs -> Running {L} DDPM steps. "
+          f"First {L_pure} pure DDPM, next {L - L_pure} with Stochastic Corrections.")
+
+    mask_idx = model.mask_index
+    eps = 1e-5
+
+    x = model._sample_prior(n_samples, gen_len).to(device)
+    timesteps = torch.linspace(1, eps, effective_steps + 1, device=device)
+    dt = (1 - eps) / effective_steps
+
+    for i in range(effective_steps):
+        t = timesteps[i] * torch.ones(n_samples, 1, device=device)
+
+        # ── 1. Standard DDPM Unmasking ─────────────────────
+        sigma_t, _ = model.noise(t)
+        sigma_s, _ = model.noise(t - dt)
+        if sigma_t.ndim > 1: sigma_t = sigma_t.squeeze(-1)
+        if sigma_s.ndim > 1: sigma_s = sigma_s.squeeze(-1)
+        move_chance_t = (1 - torch.exp(-sigma_t))[:, None, None]
+        move_chance_s = (1 - torch.exp(-sigma_s))[:, None, None]
+
+        sigma = model._process_sigma(sigma_t)
+        with torch.cuda.amp.autocast(dtype=torch.float32):
+            raw_logits = model.backbone(x, sigma)
+
+        subs_logits = raw_logits.clone()
+        subs_logits[:, :, mask_idx] += model.neg_infinity
+        subs_logits = subs_logits - torch.logsumexp(subs_logits, dim=-1, keepdim=True)
+        unmasked_indices = (x != mask_idx)
+        subs_logits[unmasked_indices] = model.neg_infinity
+        subs_logits[unmasked_indices, x[unmasked_indices]] = 0
+
+        p_x0 = subs_logits.exp()
+        q_xs = p_x0 * (move_chance_t - move_chance_s)
+        q_xs[:, :, mask_idx] = move_chance_s[:, :, 0]
+        _x = _sample_categorical(q_xs)
+
+        copy_flag = unmasked_indices.to(x.dtype)
+        x = (copy_flag * x + (1 - copy_flag) * _x).long()
+
+        # ── 2. Backloaded Stochastic Correction Pass ──────────────────
+        # We only spend NFEs on corrections in the second half of generation
+        if i >= L_pure and n_correct_per_step > 0:
+            
+            # Fill the top-50% most confident masked positions stochastically,
+            # leaving the rest masked. Confidence = p_x0 probability of the sampled token.
+            dense_guess = _sample_categorical(p_x0)
+            confidence = p_x0.gather(-1, dense_guess.unsqueeze(-1)).squeeze(-1)  # (n_samples, gen_len)
+            x_dense = x.clone()
+            for b in range(n_samples):
+                mask_pos = (x[b] == mask_idx).nonzero(as_tuple=True)[0]
+                if mask_pos.numel() == 0:
+                    continue
+                n_fill = max(1, int(mask_pos.numel() * fill_ratio))
+                _, top_idx = confidence[b][mask_pos].topk(n_fill, largest=True)
+                x_dense[b, mask_pos[top_idx]] = dense_guess[b, mask_pos[top_idx]]
+
+            # Forward pass with partially-filled context
+            with torch.cuda.amp.autocast(dtype=torch.float32):
+                corr_logits = model.backbone(x_dense, sigma)
+                
+            corr_logits[:, :, mask_idx] += model.neg_infinity
+            log_probs = corr_logits - torch.logsumexp(corr_logits, dim=-1, keepdim=True)
+            det_candidates = log_probs.argmax(dim=-1)
+
+            currently_unmasked = (x != mask_idx)
+
+            for b in range(n_samples):
+                unmasked_pos = currently_unmasked[b].nonzero(as_tuple=True)[0]
+                if unmasked_pos.numel() == 0: continue
+                
+                changed = det_candidates[b][unmasked_pos] != x[b][unmasked_pos]
+                cand_pos = unmasked_pos[changed]
+                if cand_pos.numel() == 0: continue
+                
+                log_p_new = log_probs[b][cand_pos, det_candidates[b][cand_pos]]
+                log_p_cur = log_probs[b][cand_pos, x[b][cand_pos]]
+                log_ratio = log_p_new - log_p_cur
+
+                if correct_mode == 'topk':
+                    k = min(n_correct_per_step, cand_pos.numel())
+                    _, top_idx = log_ratio.topk(k, largest=True)
+                    accept_pos = cand_pos[top_idx]
+                elif correct_mode == 'threshold':
+                    accept_pos = cand_pos[log_ratio > correct_threshold]
+
+                x[b, accept_pos] = det_candidates[b, accept_pos]
+
+    t_final = timesteps[-1] * torch.ones(n_samples, 1, device=device)
+    unet_conditioning = model.noise(t_final)[0]
+    x = model.forward(x, unet_conditioning).argmax(dim=-1)
+
+    return x
+
+@torch.no_grad()
+def sample_refine(model, n_samples: int, steps: int, gen_len: int,
+                  device: str, n_correct_per_step: int = 50,
+                  correct_mode: str = 'topk',
+                  correct_threshold: float = 0.01, **_):
+    """Single-pass DDPM + correction sampler for refine MDLM.
+
+    Inlines _ddpm_update logic to capture the raw backbone logits before SUBS
+    parameterization. Uses those same logits for the correction phase, avoiding
+    a second forward pass. Corrections are offset by one step (newly unmasked
+    tokens are corrected next step), which is negligible over many steps.
+
+    Args:
+        correct_mode: 'topk' — accept top-k corrections by confidence ratio (capped
+                          by n_correct_per_step).
+                      'threshold' — accept all corrections where
+                          log p(new) - log p(current) > correct_threshold.
+        correct_threshold: minimum log-probability ratio to accept a correction
+                           (only used when correct_mode='threshold').
+    """
+    mask_idx = model.mask_index
+    eps = 1e-5
+
+    x = model._sample_prior(n_samples, gen_len).to(device)
+    timesteps = torch.linspace(1, eps, steps + 1, device=device)
+    dt = (1 - eps) / steps
+
+    for i in range(steps):
+        t = timesteps[i] * torch.ones(n_samples, 1, device=device)
+
+        # ── Single backbone call ──────────────────────────────────────────
+        sigma_t, _ = model.noise(t)
+        sigma_s, _ = model.noise(t - dt)
+        if sigma_t.ndim > 1:
+            sigma_t = sigma_t.squeeze(-1)
+        if sigma_s.ndim > 1:
+            sigma_s = sigma_s.squeeze(-1)
+        move_chance_t = (1 - torch.exp(-sigma_t))[:, None, None]
+        move_chance_s = (1 - torch.exp(-sigma_s))[:, None, None]
+
+        sigma = model._process_sigma(sigma_t)
+        with torch.cuda.amp.autocast(dtype=torch.float32):
+            raw_logits = model.backbone(x, sigma)  # [B, L, V]
+
+        # ── SUBS parameterization (identical to _ddpm_update path) ────────
+        subs_logits = raw_logits.clone()
+        subs_logits[:, :, mask_idx] += model.neg_infinity
+        subs_logits = subs_logits - torch.logsumexp(subs_logits, dim=-1, keepdim=True)
+        unmasked_indices = (x != mask_idx)
+        subs_logits[unmasked_indices] = model.neg_infinity
+        subs_logits[unmasked_indices, x[unmasked_indices]] = 0
+
+        # ── Remember which positions are already unmasked (for correction) ─
+        previously_unmasked = (x != mask_idx)
+
+        # ── DDPM posterior sampling (unmask new tokens) ───────────────────
+        p_x0 = subs_logits.exp()
+        q_xs = p_x0 * (move_chance_t - move_chance_s)
+        q_xs[:, :, mask_idx] = move_chance_s[:, :, 0]
+        _x = _sample_categorical(q_xs)
+
+        copy_flag = previously_unmasked.to(x.dtype)
+        x = (copy_flag * x + (1 - copy_flag) * _x).long()
+
+        # ── Correction phase (reuses raw_logits from same backbone call) ──
+        # Only correct positions that were unmasked BEFORE the DDPM step.
+        # Newly unmasked positions must not be corrected: the raw logits were
+        # computed when they were still masked, so det_candidates would just
+        # be the argmax and would undo the stochastic DDPM sampling.
+        if n_correct_per_step > 0:
+            corr_logits = raw_logits.clone()
+            corr_logits[:, :, mask_idx] += model.neg_infinity
+            log_probs = corr_logits - torch.logsumexp(corr_logits, dim=-1, keepdim=True)
+            det_candidates = log_probs.argmax(dim=-1)
+
+            for b in range(n_samples):
+                unmasked_pos = previously_unmasked[b].nonzero(as_tuple=True)[0]
+                if unmasked_pos.numel() == 0:
+                    continue
+                changed = det_candidates[b][unmasked_pos] != x[b][unmasked_pos]
+                cand_pos = unmasked_pos[changed]
+                if cand_pos.numel() == 0:
+                    continue
+                log_p_new = log_probs[b][cand_pos, det_candidates[b][cand_pos]]
+                log_p_cur = log_probs[b][cand_pos, x[b][cand_pos]]
+                log_ratio = log_p_new - log_p_cur
+
+                if correct_mode == 'topk':
+                    k = min(n_correct_per_step, cand_pos.numel())
+                    _, top_idx = log_ratio.topk(k, largest=True)
+                    accept_pos = cand_pos[top_idx]
+                elif correct_mode == 'threshold':
+                    accept_pos = cand_pos[log_ratio > correct_threshold]
+                else:
+                    raise ValueError(f'Unknown correct_mode: {correct_mode}')
+
+                x[b, accept_pos] = det_candidates[b, accept_pos]
+
+    # Final noise removal
+    t_final = timesteps[-1] * torch.ones(n_samples, 1, device=device)
+    unet_conditioning = model.noise(t_final)[0]
+    x = model.forward(x, unet_conditioning).argmax(dim=-1)
+
+    return x
+
+
+SAMPLERS = {
+    'vanilla': sample_vanilla,
+    'refine':  sample_refine_v2,
+    'proseco': sample_proseco,
+    'proseco_m': sample_proseco_m,
+}
+
+# ── Batched generation ────────────────────────────────────────────────────────
+
+def generate_samples(model, sampler_name: str, n_samples: int, steps: int,
+                     gen_len: int, batch_size: int, device: str,
+                     proseco_budget: int, proseco_freq: int,
+                     corrector_sampling: str = 'argmax',
+                     correction_ratio: float = 1.0,
+                     fill_ratio: float = 0.75) -> list[str]:
+    sampler_fn = SAMPLERS[sampler_name]
+    all_tokens, remaining = [], n_samples
+
+    while remaining > 0:
+        bs = min(batch_size, remaining)
+        tokens = sampler_fn(
+            model=model, n_samples=bs, steps=steps, gen_len=gen_len,
+            device=device, proseco_budget=proseco_budget, proseco_freq=proseco_freq,
+            corrector_sampling=corrector_sampling,
+            correction_ratio=correction_ratio, fill_ratio=fill_ratio,
+        )
+        all_tokens.append(tokens.cpu())
+        remaining -= bs
+
+    return model.tokenizer.batch_decode(torch.cat(all_tokens).tolist())
+
+# ── Gen PPL ───────────────────────────────────────────────────────────────────
+
+def compute_gen_ppl(texts: list[str], eval_model_key: str,
+                    batch_size: int, device: str) -> float:
+    model_path = GEN_PPL_MODELS[eval_model_key]
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        torch_dtype=torch.float16 if device == 'cuda' else torch.float32,
+    ).eval().to(device)
+
+    max_length = min(getattr(model.config, 'max_position_embeddings', 1024), 4096)
+    stride = max_length // 2
+    total_nll, total_tokens = 0.0, 0
+
+    for text in tqdm(texts, desc=f'gen_ppl[{eval_model_key}]', leave=False):
+        enc = tokenizer(text, return_tensors='pt')
+        input_ids = enc.input_ids.to(device)
+        seq_len = input_ids.shape[1]
+        if seq_len == 0:
+            continue
+        nlls, prev_end = [], 0
+        for begin in range(0, seq_len, stride):
+            end = min(begin + max_length, seq_len)
+            trg_len = end - prev_end
+            chunk = input_ids[:, begin:end]
+            labels = chunk.clone()
+            labels[:, :-trg_len] = -100
+            with torch.no_grad():
+                nlls.append(model(chunk, labels=labels).loss * trg_len)
+            prev_end = end
+            if end == seq_len:
+                break
+        total_nll += torch.stack(nlls).sum().item()
+        total_tokens += seq_len
+
+    del model
+    if device == 'cuda':
+        torch.cuda.empty_cache()
+
+    return math.exp(total_nll / total_tokens) if total_tokens > 0 else float('inf')
+
+# ── LM Judge (Gemini batch) ──────────────────────────────────────────────────
+
+LM_JUDGE_PROMPT = (
+    "You are a language expert evaluating the fluency and coherence of the "
+    "following AI-generated text. Give a single integer score between 0 (poor) "
+    "and 100 (excellent), with no explanation or comments.\n\n"
+    "Text:\n{text}"
+)
+
+def compute_lm_judge(texts: list[str], config_key: str,
+                     save_dir: str) -> dict:
+    """Score texts with Gemini as an LM judge via batch API.
+
+    Returns dict with 'scores' (list[int]) and 'mean' (float).
+    Caches results to {save_dir}/{config_key}_lm_judge.json.
+    """
+    import time
+    import re
+    from google import genai
+
+    os.makedirs(save_dir, exist_ok=True)
+    cache_path = os.path.join(save_dir, f'{config_key}_lm_judge.json')
+
+    # Check cache
+    if os.path.exists(cache_path):
+        with open(cache_path) as f:
+            cached = json.load(f)
+        print(f'  LM judge: loaded cached scores from {cache_path}')
+        return cached
+
+    # Build batch requests
+    requests = []
+    for text in texts:
+        prompt = LM_JUDGE_PROMPT.format(text=text)
+        requests.append({
+            "contents": [{"parts": [{"text": prompt}], "role": "user"}]
+        })
+
+    client = genai.Client(api_key='AIzaSyClMl5KCmlifid5zBxjBLgA4ihHoZnTHhc')
+    job = client.batches.create(
+        model="gemini-2.5-flash",
+        src=requests,
+        config={"display_name": f"lm-judge-{config_key}"},
+    )
+    print(f'LM judge: submitted batch job {job.name} ({len(texts)} samples)')
+
+    # Poll until done
+    while job.state not in ("JOB_STATE_SUCCEEDED", "JOB_STATE_FAILED"):
+        time.sleep(30)
+        job = client.batches.get(name=job.name)
+        print(f'  LM judge: job state = {job.state}')
+
+    if job.state == "JOB_STATE_FAILED":
+        print(f'  LM judge: batch job FAILED', file=sys.stderr)
+        return {'scores': [], 'mean': float('nan')}
+
+    # Parse scores from responses
+    scores = []
+    if job.dest and job.dest.inlined_responses:
+        for i, resp in enumerate(job.dest.inlined_responses):
+            if resp.response:
+                try:
+                    raw = resp.response.text
+                    # Extract first integer from response
+                    match = re.search(r'\d+', raw)
+                    score = int(match.group()) if match else -1
+                    score = max(0, min(100, score))  # clamp to [0, 100]
+                except Exception:
+                    print("Raw text", resp.response.text)
+                    score = -1
+                scores.append(score)
+
+    valid = [s for s in scores if s >= 0]
+    mean = sum(valid) / len(valid) if valid else float('nan')
+    result = {'scores': scores, 'mean': mean}
+
+    # Save cache
+    with open(cache_path, 'w') as f:
+        json.dump(result, f, indent=2)
+    print(f'  LM judge: saved scores → {cache_path}  (mean={mean:.2f})')
+
+    return result
+
+# ── Shannon Entropy ──────────────────────────────────────────────────────────
+
+def compute_shannon_entropy(texts: list[str]) -> float:
+    tokenizer = AutoTokenizer.from_pretrained('gpt2')
+    from collections import Counter
+    counts = Counter()
+    total = 0
+    for text in texts:
+        token_ids = tokenizer.encode(text)
+        counts.update(token_ids)
+        total += len(token_ids)
+    if total == 0:
+        return 0.0
+    entropy = 0.0
+    for count in counts.values():
+        p = count / total
+        entropy -= p * math.log(p)
+    return entropy
+
+def compute_rep_n(texts: list[str], n: int = 4) -> float:
+    """Calculates the percentage of repeated n-grams in the texts."""
+    from collections import Counter
+    rep_rates = []
+    for text in texts:
+        tokens = text.split()
+        if len(tokens) < n:
+            rep_rates.append(0.0)
+            continue
+
+        ngrams = [tuple(tokens[i:i+n]) for i in range(len(tokens)-n+1)]
+        counts = Counter(ngrams)
+
+        # Number of ngrams that appear more than once
+        repeated = sum(count - 1 for count in counts.values())
+        total = len(ngrams)
+        rep_rates.append(repeated / total)
+
+    return sum(rep_rates) / len(rep_rates) if rep_rates else 0.0
+
+# ── MAUVE ─────────────────────────────────────────────────────────────────────
+
+def load_reference_texts(dataset_name: str, num_texts: int,
+                         max_text_length: int = 1024,
+                         cache_dir: str | None = None) -> list[str]:
+    """Load human reference texts from a dataset, mirroring dataloader.py logic.
+
+    Args:
+        dataset_name: One of 'openwebtext-train', 'openwebtext-valid',
+                      'wikitext103', 'wikitext2', or any HF dataset name.
+        num_texts: Number of reference texts to return.
+        max_text_length: Truncate each text to this many characters (rough guard).
+        cache_dir: HF datasets cache directory (mirrors config.data.cache_dir).
+    """
+    import datasets
+
+    if dataset_name == 'openwebtext-train':
+        ds = datasets.load_dataset(
+            'openwebtext', split='train[:-100000]',
+            cache_dir=cache_dir)
+    elif dataset_name in ('openwebtext-valid', 'openwebtext-split'):
+        ds = datasets.load_dataset(
+            'openwebtext', split='train[-100000:]',
+            cache_dir=cache_dir)
+    else:
+        ds = datasets.load_dataset(dataset_name, split='validation',
+                                   cache_dir=cache_dir)
+
+    texts = []
+    for i in range(min(num_texts, len(ds))):
+        text = ds[i].get('text', '')
+        if text.strip():
+            texts.append(text[:max_text_length])
+    return texts
+
+
+def compute_mauve_score(generated_texts: list[str],
+                        reference_texts: list[str],
+                        device_id: int = 0,
+                        max_text_length: int = 1024,
+                        featurize_model_name: str = 'gpt2-large') -> float:
+    """Compute the MAUVE score between generated and reference texts.
+
+    Args:
+        generated_texts: Machine-generated text samples.
+        reference_texts: Human reference text samples (same count).
+        device_id: GPU id (0-based) or -1 for CPU.
+        max_text_length: Truncate texts to this many tokens.
+        featurize_model_name: Model used to extract embeddings.
+
+    Returns:
+        MAUVE score in [0, 1].
+    """
+    import mauve
+
+    out = mauve.compute_mauve(
+        p_text=reference_texts,
+        q_text=generated_texts,
+        device_id=device_id,
+        max_text_length=max_text_length,
+        featurize_model_name=featurize_model_name,
+        num_buckets=50,
+    )
+    return out.mauve
+
+
+# ── Metrics ───────────────────────────────────────────────────────────────────
+
+def compute_metrics(texts: list[str], metrics: list[str], gen_models: list[str],
+                    batch_size: int, device: str,
+                    config_key: str = '', save_res_dir: str = '',
+                    reference_texts: list[str] | None = None,
+                    rep_n: int = 4) -> dict:
+    results = {}
+    if 'gen_ppl' in metrics:
+        results['gen_ppl'] = {
+            gm: compute_gen_ppl(texts, gm, batch_size, device)
+            for gm in gen_models
+        }
+    if 'entropy' in metrics:
+        results['entropy'] = compute_shannon_entropy(texts)
+    if 'rep_n' in metrics:
+        results['rep_n'] = compute_rep_n(texts, n=rep_n)
+    if 'lm_judge' in metrics:
+        judge_result = compute_lm_judge(texts, config_key, save_res_dir)
+        results['lm_judge'] = judge_result['mean']
+    if 'mauve' in metrics:
+        if reference_texts is None:
+            print('  Warning: mauve requested but no reference texts provided, skipping')
+        else:
+            device_id = 0 if device == 'cuda' else -1
+            results['mauve'] = compute_mauve_score(
+                generated_texts=texts,
+                reference_texts=reference_texts,
+                device_id=device_id,
+            )
+    return results
+
+# ── Results display ───────────────────────────────────────────────────────────
+
+def print_results_matrix(all_results: dict, models: list, samplers: list,
+                         num_steps: list, metrics: list, gen_models: list,
+                         rep_n: int = 4):
+    combos = [(m, s) for m in models for s in samplers]
+    col_w = 14
+
+    if 'gen_ppl' in metrics:
+        for gm in gen_models:
+            print(f'\n  gen_ppl  [{gm}]')
+            header = f"{'steps':>8}" + ''.join(
+                f'{f"{m}/{s}":>{col_w}}' for m, s in combos)
+            print(f'  {header}')
+
+            step_vals = {combo: [] for combo in combos}
+            for steps in num_steps:
+                row = f'{steps:>8}'
+                for combo in combos:
+                    val = all_results.get(combo + (steps,), {}) \
+                                     .get('gen_ppl', {}).get(gm, float('nan'))
+                    step_vals[combo].append(val)
+                    row += f'{val:>{col_w}.2f}'
+                print(f'  {row}')
+
+            # Average across steps
+            avg_row = f'{"avg":>8}'
+            for combo in combos:
+                vals = [v for v in step_vals[combo] if not math.isnan(v)]
+                avg = sum(vals) / len(vals) if vals else float('nan')
+                avg_row += f'{avg:>{col_w}.2f}'
+            print(f'  {"-" * (8 + col_w * len(combos))}')
+            print(f'  {avg_row}')
+
+    if 'entropy' in metrics:
+        print(f'\n  shannon entropy')
+        header = f"{'steps':>8}" + ''.join(
+            f'{f"{m}/{s}":>{col_w}}' for m, s in combos)
+        print(f'  {header}')
+
+        step_vals = {combo: [] for combo in combos}
+        for steps in num_steps:
+            row = f'{steps:>8}'
+            for combo in combos:
+                val = all_results.get(combo + (steps,), {}) \
+                                 .get('entropy', float('nan'))
+                step_vals[combo].append(val)
+                row += f'{val:>{col_w}.4f}'
+            print(f'  {row}')
+
+        avg_row = f'{"avg":>8}'
+        for combo in combos:
+            vals = [v for v in step_vals[combo] if not math.isnan(v)]
+            avg = sum(vals) / len(vals) if vals else float('nan')
+            avg_row += f'{avg:>{col_w}.4f}'
+        print(f'  {"-" * (8 + col_w * len(combos))}')
+        print(f'  {avg_row}')
+
+    if 'rep_n' in metrics:
+        print(f'\n  rep-{rep_n} (0-1, lower is better)')
+        header = f"{'steps':>8}" + ''.join(
+            f'{f"{m}/{s}":>{col_w}}' for m, s in combos)
+        print(f'  {header}')
+
+        step_vals = {combo: [] for combo in combos}
+        for steps in num_steps:
+            row = f'{steps:>8}'
+            for combo in combos:
+                val = all_results.get(combo + (steps,), {}) \
+                                 .get('rep_n', float('nan'))
+                step_vals[combo].append(val)
+                row += f'{val:>{col_w}.4f}'
+            print(f'  {row}')
+
+        avg_row = f'{"avg":>8}'
+        for combo in combos:
+            vals = [v for v in step_vals[combo] if not math.isnan(v)]
+            avg = sum(vals) / len(vals) if vals else float('nan')
+            avg_row += f'{avg:>{col_w}.4f}'
+        print(f'  {"-" * (8 + col_w * len(combos))}')
+        print(f'  {avg_row}')
+
+    if 'lm_judge' in metrics:
+        print(f'\n  lm_judge (gemini, 0-100)')
+        header = f"{'steps':>8}" + ''.join(
+            f'{f"{m}/{s}":>{col_w}}' for m, s in combos)
+        print(f'  {header}')
+
+        step_vals = {combo: [] for combo in combos}
+        for steps in num_steps:
+            row = f'{steps:>8}'
+            for combo in combos:
+                val = all_results.get(combo + (steps,), {}) \
+                                 .get('lm_judge', float('nan'))
+                step_vals[combo].append(val)
+                row += f'{val:>{col_w}.2f}'
+            print(f'  {row}')
+
+        avg_row = f'{"avg":>8}'
+        for combo in combos:
+            vals = [v for v in step_vals[combo] if not math.isnan(v)]
+            avg = sum(vals) / len(vals) if vals else float('nan')
+            avg_row += f'{avg:>{col_w}.2f}'
+        print(f'  {"-" * (8 + col_w * len(combos))}')
+        print(f'  {avg_row}')
+
+    if 'mauve' in metrics:
+        print(f'\n  mauve (0-1, higher is better)')
+        header = f"{'steps':>8}" + ''.join(
+            f'{f"{m}/{s}":>{col_w}}' for m, s in combos)
+        print(f'  {header}')
+
+        step_vals = {combo: [] for combo in combos}
+        for steps in num_steps:
+            row = f'{steps:>8}'
+            for combo in combos:
+                val = all_results.get(combo + (steps,), {}) \
+                                 .get('mauve', float('nan'))
+                step_vals[combo].append(val)
+                row += f'{val:>{col_w}.4f}'
+            print(f'  {row}')
+
+        avg_row = f'{"avg":>8}'
+        for combo in combos:
+            vals = [v for v in step_vals[combo] if not math.isnan(v)]
+            avg = sum(vals) / len(vals) if vals else float('nan')
+            avg_row += f'{avg:>{col_w}.4f}'
+        print(f'  {"-" * (8 + col_w * len(combos))}')
+        print(f'  {avg_row}')
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
+def parse_args():
+    p = argparse.ArgumentParser(description='MDLM unified evaluation harness')
+    p.add_argument('--models',   nargs='+', choices=['vanilla', 'refine', 'proseco'], required=True)
+    p.add_argument('--samplers', nargs='+', choices=['vanilla', 'refine', 'proseco', 'proseco_m'], required=True)
+    p.add_argument('--num_samples',    type=int, required=True)
+    p.add_argument('--num_steps',      nargs='+', type=int, required=True)
+    p.add_argument('--gen_len',        type=int, required=True)
+    p.add_argument('--metrics',        nargs='+', default=['gen_ppl'])
+    p.add_argument('--gen_model',      nargs='+', choices=['gpt2', 'llama3b', 'llama1b'], default=[])
+    p.add_argument('--save_gen_dir',   default=None, help='Directory to save generated samples')
+    p.add_argument('--save_res_dir',   required=True, help='Directory to save results JSON')
+    p.add_argument('--proseco_budget', type=int, default=3,  help='S: corrector forward passes')
+    p.add_argument('--proseco_freq',   type=int, default=1,  help='omega: corrector frequency')
+    p.add_argument('--corrector_sampling', choices=['argmax', 'topk'], default='argmax',
+                   help='Token selection method in corrector phase (topk uses k=100)')
+    p.add_argument('--correction_ratio', type=float, default=1.0,
+                   help='Correction ratio for refine sampler (fraction of steps used for correction)')
+    p.add_argument('--fill_ratio', type=float, default=0.75,
+                   help='Fill ratio for refine sampler (fraction of masked positions to fill in correction)')
+    p.add_argument('--eval_batch_size', type=int, default=16)
+    p.add_argument('--skip_inference', action='store_true',
+                   help='Skip generation; load samples from save_gen_dir instead')
+    p.add_argument('--seed', type=int, default=42,
+                   help='Random seed for reproducibility (default: 42)')
+    p.add_argument('--rep_n', type=int, default=4,
+                   help='N-gram size for rep_n metric (default: 4)')
+    p.add_argument('--mauve_dataset', type=str, default='openwebtext-valid',
+                   help='Dataset for MAUVE reference texts (e.g. openwebtext-valid, openwebtext-split, wikitext103)')
+    p.add_argument('--cache_dir', type=str, default=None,
+                   help='HF datasets cache directory (mirrors config.data.cache_dir)')
+    return p.parse_args()
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    args = parse_args()
+
+    import numpy as np
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    os.makedirs(args.save_res_dir, exist_ok=True)
+    if args.save_gen_dir:
+        os.makedirs(args.save_gen_dir, exist_ok=True)
+
+    if args.skip_inference and not args.save_gen_dir:
+        print('Error: --skip_inference requires --save_gen_dir', file=sys.stderr)
+        sys.exit(1)
+
+    all_results = {}
+
+    # Load MAUVE reference texts once (shared across all configs)
+    reference_texts = None
+    if 'mauve' in args.metrics:
+        print(f'\n[Loading MAUVE reference texts from {args.mauve_dataset}]')
+        reference_texts = load_reference_texts(
+            args.mauve_dataset, num_texts=args.num_samples,
+            cache_dir=args.cache_dir)
+        print(f'  Loaded {len(reference_texts)} reference texts')
+
+    if args.skip_inference:
+        for model_name in args.models:
+            for sampler_name in args.samplers:
+                for steps in args.num_steps:
+                    key = (model_name, sampler_name, steps)
+                    fname = f'{model_name}_{sampler_name}_steps{steps}.jsonl'
+                    fpath = os.path.join(args.save_gen_dir, fname)
+                    if not os.path.exists(fpath):
+                        print(f'  Warning: {fpath} not found, skipping')
+                        continue
+                    print(f'\n  Loading samples: {fpath}')
+                    with open(fpath) as f:
+                        texts = [json.loads(line) for line in f]
+                    print(f'  Loaded {len(texts)} samples')
+
+                    config_key = f'{model_name}_{sampler_name}_steps{steps}'
+                    results = compute_metrics(
+                        texts=texts, metrics=args.metrics,
+                        gen_models=args.gen_model,
+                        batch_size=args.eval_batch_size, device=device,
+                        config_key=config_key, save_res_dir=args.save_res_dir,
+                        reference_texts=reference_texts,
+                        rep_n=args.rep_n,
+                    )
+                    all_results[key] = results
+                    print(f'  {results}')
+    else:
+        global dataloader, diffusion_module, _sample_categorical
+        import dataloader
+        import diffusion as diffusion_module
+        from diffusion import _sample_categorical
+        
+        for model_name in args.models:
+            print(f'\n[Loading model: {model_name}]')
+            model = load_mdlm(model_name, device)
+
+            for sampler_name in args.samplers:
+                for steps in args.num_steps:
+                    key = (model_name, sampler_name, steps)
+                    print(f'\n  model={model_name}  sampler={sampler_name}  steps={steps}')
+
+                    texts = generate_samples(
+                        model=model, sampler_name=sampler_name,
+                        n_samples=args.num_samples, steps=steps,
+                        gen_len=args.gen_len, batch_size=args.eval_batch_size,
+                        device=device, proseco_budget=args.proseco_budget,
+                        proseco_freq=args.proseco_freq,
+                        corrector_sampling=args.corrector_sampling,
+                        correction_ratio=args.correction_ratio,
+                        fill_ratio=args.fill_ratio,
+                    )
+
+                    if args.save_gen_dir:
+                        fname = f'{model_name}_{sampler_name}_steps{steps}.jsonl'
+                        fpath = os.path.join(args.save_gen_dir, fname)
+                        with open(fpath, 'w') as f:
+                            for t in texts:
+                                f.write(json.dumps(t) + '\n')
+                        print(f'  Saved {len(texts)} samples → {fpath}')
+
+                    config_key = f'{model_name}_{sampler_name}_steps{steps}'
+                    results = compute_metrics(
+                        texts=texts, metrics=args.metrics,
+                        gen_models=args.gen_model,
+                        batch_size=args.eval_batch_size, device=device,
+                        config_key=config_key, save_res_dir=args.save_res_dir,
+                        reference_texts=reference_texts,
+                        rep_n=args.rep_n,
+                    )
+                    all_results[key] = results
+                    print(f'  {results}')
+
+            del model
+            if device == 'cuda':
+                torch.cuda.empty_cache()
+
+    # Save results JSON
+    serializable = {
+        f'{m}_{s}_steps{t}': v
+        for (m, s, t), v in all_results.items()
+    }
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    res_path = os.path.join(args.save_res_dir, f'results_{timestamp}.json')
+    with open(res_path, 'w') as f:
+        json.dump(serializable, f, indent=2)
+    print(f'\nResults saved → {res_path}')
+
+    # Print results matrix
+    print(f'\n{"=" * 70}  RESULTS MATRIX  {"=" * 70}')
+    print_results_matrix(
+        all_results, args.models, args.samplers,
+        args.num_steps, args.metrics, args.gen_model,
+        rep_n=args.rep_n,
+    )
+
+
+if __name__ == '__main__':
+    main()
