@@ -623,7 +623,7 @@ def sample_refine_v2(model, n_samples: int, steps: int, gen_len: int,
                                         device: str, n_correct_per_step: int = 50,
                                         correct_mode: str = 'topk',
                                         correct_threshold: float = 0.01,
-                                        correction_ratio: float = 1.0,
+                                        correction_ratio: float = 0.5,
                                         fill_ratio: float = 0.75, **_):
     """
     Stochastic Backloaded Refine Sampler.

@@ -7,3 +7,11 @@ mdlm/eval
 mdlm/checkpoints
 mdlm/__pycache__
 mdlm/.env
+
+diffusion-vs-ar/slurm_output
+diffusion-vs-ar/wandb
+diffusion-vs-ar/eval_results
+diffusion-vs-ar/data
+diffusion-vs-ar/cache
+**/__pycache__
+**/*.pyc
