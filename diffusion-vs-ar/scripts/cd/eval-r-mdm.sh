@@ -16,33 +16,35 @@
 export WANDB_DISABLED=true
 export WANDB_PROJECT="diffusion-vs-ar"
 
+sampling=vanilla
+model=refine
+exp=/nfs/turbo/coe-jjparkcv-medium/satyam/sr/cd5/${model}
+eval=/home/sagoyal/research/mdlm_refine/diffusion-vs-ar/eval_results/cd5/${model}
 
-exp=/nfs/turbo/coe-jjparkcv-medium/satyam/sr/sudoku/refine
-eval=/home/sagoyal/research/diffusion-vs-ar/eval_results/sudoku/refine
 mkdir -p $exp
 mkdir -p $eval
 
-for dataset in sudoku_test
+for dataset in cd5_test
 do
 topk_decoding=True
-mkdir $eval/$dataset
+
 CUDA_VISIBLE_DEVICES=0  \
 python3 -u src/train_bash.py \
     --stage mdm --overwrite_output_dir \
     --cache_dir /nfs/turbo/coe-jjparkcv-medium/satyam/.cache \
-    --model_name_or_path model_config_tiny \
+    --model_name_or_path model_config \
     --do_predict \
-    --cutoff_len 164 \
+    --cutoff_len 64 \
     --dataset $dataset \
     --finetuning_type full \
-    --diffusion_steps 4 \
-    --output_dir $exp/${dataset} \
+    --diffusion_steps 20 \
+    --output_dir $eval/${sampling} \
     --checkpoint_dir $exp  \
     --remove_unused_columns False \
     --decoding_strategy stochastic0.5-linear \
     --topk_decoding $topk_decoding \
-    --sampling_method vanilla \
+    --sampling_method $sampling \
     --n_correct_per_step 5 \
     --correct_mode topk \
-    > $eval/${dataset}/eval-TopK$topk_decoding.log
+    > $eval/eval-TopK$topk_decoding.log
 done
