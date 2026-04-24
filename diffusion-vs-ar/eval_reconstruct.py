@@ -104,9 +104,18 @@ def prepare_sample(prompt_text, response_text, tok, L, rng, mask_frac, corrupt_f
 
     x_init = x_orig.clone()
     x_init[masked_pos] = mask_id
-    # Corrupt: sample random tokens in [0, vocab_size) but skip mask_id
+    # Corrupt: sample random tokens in [0, vocab_size) excluding mask_id and the
+    # original token at each position (so corruption is never a no-op).
     rand_tokens = torch.randint(0, vocab_size - 1, (n_corrupt,), device=device, generator=g)
     rand_tokens[rand_tokens >= mask_id] += 1
+    orig_at_corrupt = x_orig[corrupt_positions]
+    collision = rand_tokens == orig_at_corrupt
+    while collision.any():
+        n_re = int(collision.sum())
+        resample = torch.randint(0, vocab_size - 1, (n_re,), device=device, generator=g)
+        resample[resample >= mask_id] += 1
+        rand_tokens[collision] = resample
+        collision = rand_tokens == orig_at_corrupt
     x_init[corrupt_positions] = rand_tokens
 
     return x_orig, x_init, src_mask, content_mask, masked_pos, corrupt_pos
@@ -165,6 +174,13 @@ def _verbose_print(tag, tok, xt, content_mask):
 @torch.no_grad()
 def reconstruct(sampler, model, x_init, src_mask, content_mask, *, args, tok, verbose=False):
     """Dispatch to the chosen reconstruction sampler."""
+    if verbose:
+        # verbose forces batch_size=1, so just inspect element 0
+        idx = content_mask[0].nonzero(as_tuple=True)[0]
+        if idx.numel() > 0:
+            tgt_start = idx.min().item()
+            prompt_ids = x_init[0, :tgt_start].tolist()
+            print("PROMPT:", tok.decode(prompt_ids))
     if sampler == 'vanilla':
         return _recon_vanilla(model, x_init, src_mask, content_mask, args=args, tok=tok, verbose=verbose)
     elif sampler == 'refine':
@@ -177,7 +193,7 @@ def reconstruct(sampler, model, x_init, src_mask, content_mask, *, args, tok, ve
 
 @torch.no_grad()
 def _recon_vanilla(model, x_init, src_mask, content_mask, *, args, tok, verbose):
-    """Vanilla: only originally-masked positions get filled; corrupt/clean untouched."""
+    """Mirrors trainer.py:generate_samples_vanilla, starting from x_init."""
     mask_id = tok.mask_token_id
     T = args.diffusion_steps
     device = x_init.device
@@ -186,8 +202,9 @@ def _recon_vanilla(model, x_init, src_mask, content_mask, *, args, tok, verbose)
     xt = x_init.clone()
     attention_mask = torch.ones_like(xt)
 
-    # Only currently-masked (within target region) positions are maskable.
-    init_maskable_mask = maskable_mask = (xt == mask_id) & (~src_mask)
+    # Entire target region is in scope (matches trainer.py). With topk, this means
+    # corrupt/clean positions can also be re-proposed each step.
+    init_maskable_mask = maskable_mask = ~src_mask
 
     for t in range(T - 1, -1, -1):
         if verbose:
@@ -234,16 +251,14 @@ def _recon_refine(model, x_init, src_mask, content_mask, *, args, tok, verbose):
     xt = x_init.clone()
     attention_mask = torch.ones_like(xt)
 
-    init_maskable_mask = maskable_mask = (xt == mask_id) & (~src_mask)
-    # Everything inside content that is not maskable = already "unmasked" target tokens.
-    target_region = (~src_mask)  # includes content + any pad-in-src-mask-region
+    init_maskable_mask = maskable_mask = ~src_mask
 
     n_correct_per_step = args.n_correct_per_step
     correct_mode = args.correct_mode
     correct_threshold = args.correct_threshold
 
     for t in range(T - 1, -1, -1):
-        previously_unmasked = (xt != mask_id) & target_region
+        previously_unmasked = (xt != mask_id) & init_maskable_mask
 
         if verbose:
             _verbose_print(f"t={t+1}(in):", tok, xt, content_mask)
@@ -314,8 +329,7 @@ def _recon_proseco(model, x_init, src_mask, content_mask, *, args, tok, verbose)
     xt = x_init.clone()
     attention_mask = torch.ones_like(xt)
 
-    init_maskable_mask = maskable_mask = (xt == mask_id) & (~src_mask)
-    target_region = (~src_mask)
+    init_maskable_mask = maskable_mask = ~src_mask
 
     actual_steps = max(int(T * omega / (omega + S)), 1)
 
@@ -343,9 +357,9 @@ def _recon_proseco(model, x_init, src_mask, content_mask, *, args, tok, verbose)
                 corr_scores[:, :, tok.vocab_size:] = -1000
                 corr_preds = corr_scores.argmax(dim=-1)
                 # Only refresh target-region positions
-                corrector_x = xt.masked_scatter(target_region, corr_preds[target_region])
+                corrector_x = xt.masked_scatter(init_maskable_mask, corr_preds[init_maskable_mask])
 
-            already_unmasked = (xt != mask_id) & target_region
+            already_unmasked = (xt != mask_id) & init_maskable_mask
             xt = torch.where(already_unmasked, corrector_x, xt)
             x0 = corrector_x
             x0_scores = corr_scores.max(-1)[0]
@@ -452,28 +466,75 @@ def parse_args():
 
 # ── Metrics + visualization ──────────────────────────────────────────────────
 
-def visualize(tok, x_orig, x_init, x_out, content_mask, masked_pos, corrupt_pos):
+def visualize(tok, x_orig, x_init, x_out, content_mask, masked_pos, corrupt_pos, chunk=50):
+    """Color-coded visualization (mirrors mdlm/eval_reconstruct.py:visualize).
+
+    INPUT legend:   [M] yellow = masked,  [C:tok] red = corrupted,  tok = clean
+    OUTPUT legend:  green = recovered/corrected at masked|corrupt position,
+                    [tok] red = wrong (vs original),  tok = unchanged correct
+    """
+    try:
+        from rich.console import Console
+        from rich.text import Text
+        console = Console()
+        use_rich = True
+    except ImportError:
+        use_rich = False
+
     idx = content_mask.nonzero(as_tuple=True)[0]
     if idx.numel() == 0:
         return
     start, end = idx.min().item(), idx.max().item() + 1
-    mask_id = tok.mask_token_id
 
-    def row(xs, tag_pos=None):
-        out = []
-        for i in range(start, end):
-            tok_str = tok.decode([xs[i].item()])
-            if tag_pos is not None and tag_pos[i]:
-                out.append(f'[{tok_str}]')
-            elif xs[i].item() == mask_id:
-                out.append('[M]')
-            else:
-                out.append(tok_str)
-        return ' '.join(out)
+    prompt_text = tok.decode(x_orig[:start].tolist())
+    if use_rich:
+        prompt_line = Text("PROMPT:   ")
+        prompt_line.append(prompt_text, style="cyan")
+        console.print(prompt_line)
+    else:
+        print("PROMPT:  ", prompt_text)
 
-    print('ORIG:', row(x_orig))
-    print('IN:  ', row(x_init, masked_pos | corrupt_pos))
-    print('OUT: ', row(x_out))
+    for cstart in range(start, end, chunk):
+        cend = min(cstart + chunk, end)
+        orig_toks = [tok.decode([x_orig[i].item()]) for i in range(cstart, cend)]
+        init_toks = [tok.decode([x_init[i].item()]) for i in range(cstart, cend)]
+        out_toks  = [tok.decode([x_out[i].item()])  for i in range(cstart, cend)]
+
+        if use_rich:
+            orig_line = Text("ORIGINAL: ")
+            init_line = Text("INPUT:    ")
+            out_line  = Text("OUTPUT:   ")
+            for i, pos in enumerate(range(cstart, cend)):
+                orig_line.append(orig_toks[i] + " ")
+                if masked_pos[pos]:
+                    init_line.append("[M] ", style="yellow")
+                elif corrupt_pos[pos]:
+                    init_line.append(f"[C:{init_toks[i]}] ", style="red")
+                else:
+                    init_line.append(init_toks[i] + " ")
+                correct = (x_out[pos] == x_orig[pos]).item()
+                is_special = bool(masked_pos[pos]) or bool(corrupt_pos[pos])
+                if is_special and correct:
+                    out_line.append(out_toks[i] + " ", style="green")
+                elif not correct:
+                    out_line.append(f"[{out_toks[i]}] ", style="red")
+                else:
+                    out_line.append(out_toks[i] + " ")
+            console.print(orig_line)
+            console.print(init_line)
+            console.print(out_line)
+            console.print()
+        else:
+            init_str = " ".join(
+                "[M]" if masked_pos[p] else f"[C:{init_toks[i]}]" if corrupt_pos[p] else init_toks[i]
+                for i, p in enumerate(range(cstart, cend)))
+            out_str = " ".join(
+                f"[OK:{out_toks[i]}]" if (x_out[p] == x_orig[p]).item() else f"[X:{out_toks[i]}]"
+                for i, p in enumerate(range(cstart, cend)))
+            print("ORIG:", " ".join(orig_toks))
+            print("IN:  ", init_str)
+            print("OUT: ", out_str)
+            print()
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -612,11 +673,20 @@ def main():
     print(f'  Edit precision:      {fmt_avg(ep_avg)}')
     print(f'  Clean preservation:  {fmt_avg(cp_avg)}')
     print(f'  Overall accuracy:    {fmt_avg(ov_avg)}')
+    print(f'  Model={args.model_name_or_path}')
+    print(f'  Checkpoint={args.checkpoint_dir}')
     print(f'  Sampler={args.sampler}  steps={args.diffusion_steps}')
+    if args.sampler == 'vanilla':
+        print(f'  topk_decoding={args.topk_decoding}  decoding_strategy={args.decoding_strategy}')
+    elif args.sampler == 'refine':
+        print(f'  topk_decoding={args.topk_decoding}  decoding_strategy={args.decoding_strategy}')
+        print(f'  n_correct_per_step={args.n_correct_per_step}  correct_mode={args.correct_mode}'
+              + (f'  correct_threshold={args.correct_threshold}' if args.correct_mode == 'threshold' else ''))
+    elif args.sampler == 'proseco':
+        print(f'  topk_decoding={args.topk_decoding}  decoding_strategy={args.decoding_strategy}')
+        print(f'  proseco_budget={args.proseco_budget}  proseco_freq={args.proseco_freq}')
     print(f'  mask_frac={args.mask_frac}  corrupt_frac={args.corrupt_frac}')
     print(f'  n_samples={n_total}  eval_batch_size={batch_size}')
-    if args.sampler == 'proseco':
-        print(f'  proseco_budget={args.proseco_budget}  proseco_freq={args.proseco_freq}')
     print('=' * 55)
 
     tag = args.dataset or os.path.splitext(os.path.basename(args.input_file))[0]
