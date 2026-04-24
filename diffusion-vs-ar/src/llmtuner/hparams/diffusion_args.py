@@ -77,6 +77,10 @@ class DiffusionArguments:
         default=5,
         metadata={"help": "omega — run the corrector every omega outer steps in proseco sampling"}
     )
+    show_mistakes: bool = field(
+        default=False,
+        metadata={"help": "during verbose prediction, only print the diffusion trajectory for samples whose final output differs from the ground truth in the target region"}
+    )
 
     def __post_init__(self):
         pass
