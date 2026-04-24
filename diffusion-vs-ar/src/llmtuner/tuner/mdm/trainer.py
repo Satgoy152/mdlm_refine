@@ -39,6 +39,18 @@ class CustomDiffusionTrainer(Trainer):
         super().__init__(model, args, data_collator, train_dataset, eval_dataset, tokenizer, model_init, compute_metrics, callbacks, optimizers, preprocess_logits_for_metrics)
         self.diff_args = diff_args
         print(self.diff_args)
+        self._loss_1_running = 0.0
+        self._loss_2_running = 0.0
+        self._refine_log_count = 0
+
+    def log(self, logs, *args, **kwargs):
+        if self.diff_args.refine and self._refine_log_count > 0:
+            logs["loss_1"] = self._loss_1_running / self._refine_log_count
+            logs["loss_2"] = self._loss_2_running / self._refine_log_count
+            self._loss_1_running = 0.0
+            self._loss_2_running = 0.0
+            self._refine_log_count = 0
+        super().log(logs, *args, **kwargs)
 
     def compute_loss(
         self,
@@ -176,7 +188,7 @@ class CustomDiffusionTrainer(Trainer):
 
         # Remask low-confidence tokens among the originally-masked positions
         original_mask = (x_t == self.tokenizer.mask_token_id)
-        x_t2 = self._remask_tokens(logits, sampled_tokens, original_mask, remask_ratio)
+        x_t2 = self._remask_tokens(x_t, logits, sampled_tokens, original_mask, remask_ratio)
 
         # Pass 2 forward
         logits_2 = model(x_t2, t, attention_mask=attention_mask)
@@ -186,30 +198,36 @@ class CustomDiffusionTrainer(Trainer):
         # This means model-filled positions from pass 1 that are now unmasked still get loss signal
         loss_2 = F.cross_entropy(logits_2.reshape(-1, vocab_size), x.reshape(-1), reduction="none").float()
 
-        if self.diff_args.proseco:
-            # proseco: loss over entire target sequence (all non-source positions)
-            loss_2_mask = ~src_mask
-            loss_2 = loss_2.masked_fill(src_mask.reshape(-1), 0)
-        else:
-            loss_2_mask = loss_mask
-            loss_2 = loss_2.masked_fill(~loss_mask.reshape(-1), 0)
+        loss_2_mask = ~src_mask
+        loss_2 = loss_2.masked_fill(src_mask.reshape(-1), 0)
+        # if self.diff_args.proseco:
+        #     # proseco: loss over entire target sequence (all non-source positions)
+        #     loss_2_mask = ~src_mask
+        #     loss_2 = loss_2.masked_fill(src_mask.reshape(-1), 0)
+        # else:
+        #     loss_2_mask = loss_mask
+        #     loss_2 = loss_2.masked_fill(~loss_mask.reshape(-1), 0)
 
         if self.diff_args.token_reweighting:
             loss_2 = self.diff_args.alpha * (1 - torch.exp(-loss_2)) ** self.diff_args.gamma * loss_2
 
         loss_2 = (loss_2 * weight.reshape(-1)).sum() / loss_2_mask.sum()
 
+        if model.training:
+            self._loss_1_running += loss_1.item()
+            self._loss_2_running += loss_2.detach().item()
+            self._refine_log_count += 1
+
         # Trainer calls backward on this; loss_1 grads already accumulated above.
         return loss_2 * loss_2_scale
 
     def _add_gumbel_noise(self, logits, temperature):
-        """Gumbel-max sampling for categorical distributions."""
+        """Add temperature-scaled Gumbel(0,1) noise; argmax samples from softmax(logits/T)."""
         if temperature == 0:
             return logits
-        logits = logits.to(torch.float64)
-        noise = torch.rand_like(logits, dtype=torch.float64)
-        gumbel_noise = (- torch.log(noise)) ** temperature
-        return logits.exp() / gumbel_noise
+        u = torch.rand_like(logits).clamp_(min=1e-20, max=1.0 - 1e-7)
+        gumbel = -torch.log(-torch.log(u))
+        return logits + temperature * gumbel
 
     def _get_remask_ratio(self, t, num_timesteps, batch_size, device):
         """Compute per-sample remask ratio based on config."""
@@ -223,10 +241,11 @@ class CustomDiffusionTrainer(Trainer):
         else:
             return torch.full((batch_size,), float(cfg), device=device)
 
-    def _remask_tokens(self, logits, sampled_tokens, original_mask, remask_ratio):
+    def _remask_tokens(self, x_t, logits, sampled_tokens, original_mask, remask_ratio):
         """
         Remask lowest-confidence tokens among originally-masked positions.
 
+        x_t:           (batch, seq_len) pass-1 input; source tokens at ~original_mask
         logits:        (batch, seq_len, vocab) from pass 1
         sampled_tokens: argmax samples from pass 1
         original_mask:  bool, True where x_t == mask_token_id
@@ -239,9 +258,9 @@ class CustomDiffusionTrainer(Trainer):
         confidence = sampled_probs.clone()
         confidence[~original_mask] = float('inf')  # never remask positions that weren't masked
 
-        result = sampled_tokens.clone()
-        # Keep unmasked positions from x_t unchanged
-        result[~original_mask] = sampled_tokens[~original_mask]
+        # Preserve source tokens from x_t; fill masked positions with pass-1 samples
+        result = x_t.clone()
+        result[original_mask] = sampled_tokens[original_mask]
 
         for b in range(sampled_tokens.shape[0]):
             num_masked = original_mask[b].sum().item()
@@ -283,6 +302,8 @@ class CustomDiffusionTrainer(Trainer):
         self.model.cuda()
         self.model.eval()
         verbose = not self.is_in_train
+        show_mistakes = verbose and getattr(self.diff_args, 'show_mistakes', False)
+        log_buffer = [] if verbose else None
         x = inputs['input_ids'].cuda()
         src_mask = inputs['src_mask'].bool().cuda()
         attention_mask = torch.ones_like(x)
@@ -297,7 +318,7 @@ class CustomDiffusionTrainer(Trainer):
                     xt = x.masked_fill(maskable_mask, self.tokenizer.mask_token_id)
 
                 if verbose:
-                    print(f"t={t+1}(in):", self.tokenizer.decode(xt.tolist()[0]))
+                    log_buffer.append(f"t={t+1}(in): " + self.tokenizer.decode(xt.tolist()[0]))
 
                 t_tensor = torch.full((batch_size, ), t, device=x.device)
                 logits = self.model(xt, t_tensor, attention_mask=attention_mask)
@@ -310,7 +331,7 @@ class CustomDiffusionTrainer(Trainer):
                 #### keep non-[MASK] positions as still
                 x0 = xt.masked_scatter(maskable_mask, x0[maskable_mask])
                 if verbose:
-                    print(f"t={t+1}(out):", self.tokenizer.decode(x0.tolist()[0]))
+                    log_buffer.append(f"t={t+1}(out): " + self.tokenizer.decode(x0.tolist()[0]))
 
                 if t > 0:
                     if self.diff_args.topk_decoding:
@@ -333,6 +354,8 @@ class CustomDiffusionTrainer(Trainer):
                         maskable_mask.masked_fill_(mask_to_x0, False)
                 else:
                     xt = x0
+        if verbose:
+            self._flush_trajectory_log(log_buffer, xt, x, src_mask, show_mistakes)
         return xt
 
     def generate_samples_refine(self, inputs):
@@ -345,6 +368,8 @@ class CustomDiffusionTrainer(Trainer):
         self.model.cuda()
         self.model.eval()
         verbose = not self.is_in_train
+        show_mistakes = verbose and getattr(self.diff_args, 'show_mistakes', False)
+        log_buffer = [] if verbose else None
         x = inputs['input_ids'].cuda()
         src_mask = inputs['src_mask'].bool().cuda()
         attention_mask = torch.ones_like(x)
@@ -366,7 +391,7 @@ class CustomDiffusionTrainer(Trainer):
                 previously_unmasked = (xt != mask_token_id) & init_maskable_mask
 
                 if verbose:
-                    print(f"t={t+1}(in):", self.tokenizer.decode(xt.tolist()[0]))
+                    log_buffer.append(f"t={t+1}(in): " + self.tokenizer.decode(xt.tolist()[0]))
 
                 t_tensor = torch.full((batch_size, ), t, device=x.device)
                 logits = self.model(xt, t_tensor, attention_mask=attention_mask)
@@ -379,7 +404,7 @@ class CustomDiffusionTrainer(Trainer):
                 #### keep non-[MASK] positions as still
                 x0 = xt.masked_scatter(maskable_mask, x0[maskable_mask])
                 if verbose:
-                    print(f"t={t+1}(out):", self.tokenizer.decode(x0.tolist()[0]))
+                    log_buffer.append(f"t={t+1}(out): " + self.tokenizer.decode(x0.tolist()[0]))
 
                 if t > 0:
                     if self.diff_args.topk_decoding:
@@ -435,6 +460,8 @@ class CustomDiffusionTrainer(Trainer):
 
                         xt[b, accept_pos] = det_candidates[b, accept_pos]
 
+        if verbose:
+            self._flush_trajectory_log(log_buffer, xt, x, src_mask, show_mistakes)
         return xt
 
     def generate_samples_proseco(self, inputs):
@@ -448,6 +475,8 @@ class CustomDiffusionTrainer(Trainer):
         self.model.cuda()
         self.model.eval()
         verbose = not self.is_in_train
+        show_mistakes = verbose and getattr(self.diff_args, 'show_mistakes', False)
+        log_buffer = [] if verbose else None
         x = inputs['input_ids'].cuda()
         src_mask = inputs['src_mask'].bool().cuda()
         attention_mask = torch.ones_like(x)
@@ -474,7 +503,7 @@ class CustomDiffusionTrainer(Trainer):
                     xt = x.masked_fill(maskable_mask, mask_token_id)
 
                 if verbose:
-                    print(f"t={t+1}(in):", self.tokenizer.decode(xt.tolist()[0]))
+                    log_buffer.append(f"t={t+1}(in): " + self.tokenizer.decode(xt.tolist()[0]))
 
                 t_tensor = torch.full((batch_size, ), t, device=x.device)
                 logits = self.model(xt, t_tensor, attention_mask=attention_mask)
@@ -487,7 +516,7 @@ class CustomDiffusionTrainer(Trainer):
                 #### keep non-[MASK] positions as still
                 x0 = xt.masked_scatter(maskable_mask, x0[maskable_mask])
                 if verbose:
-                    print(f"t={t+1}(out):", self.tokenizer.decode(x0.tolist()[0]))
+                    log_buffer.append(f"t={t+1}(out): " + self.tokenizer.decode(x0.tolist()[0]))
 
                 # ── ProSeCo corrector (every omega steps) ──
                 if (step_i + 1) % omega == 0 and t > 0:
@@ -536,7 +565,25 @@ class CustomDiffusionTrainer(Trainer):
                 else:
                     xt = x0
 
+        if verbose:
+            self._flush_trajectory_log(log_buffer, xt, x, src_mask, show_mistakes)
         return xt
+
+    def _flush_trajectory_log(self, log_buffer, xt, x, src_mask, show_mistakes):
+        """Print the buffered t=(in)/(out) lines for sample 0.
+
+        If show_mistakes is True, only print when sample 0's final prediction
+        disagrees with the ground truth in the target region (~src_mask).
+        """
+        if not log_buffer:
+            return
+        if show_mistakes:
+            target = ~src_mask[0]
+            if not (xt[0][target] != x[0][target]).any().item():
+                return
+            print("=== MISTAKE ===")
+        for line in log_buffer:
+            print(line)
 
 def topk_masking(scores, cutoff_len, stochastic=False, temp=1.0):
     """
