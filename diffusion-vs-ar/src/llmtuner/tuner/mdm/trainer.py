@@ -186,16 +186,24 @@ class CustomDiffusionTrainer(Trainer):
         else:
             remask_ratio = self._get_remask_ratio(t, num_timesteps, batch_size, x.device)
 
-        # Remask low-confidence tokens among the originally-masked positions
+        # Remask low-confidence tokens among the originally-masked positions.
+        # NOTE: _remask_tokens also swaps ALL non-source positions with pass-1 argmax
+        # (including positions that held ground truth in pass 1). See banner in that fn.
         original_mask = (x_t == self.tokenizer.mask_token_id)
-        x_t2 = self._remask_tokens(x_t, logits, sampled_tokens, original_mask, remask_ratio)
+        x_t2 = self._remask_tokens(x_t, logits, sampled_tokens, original_mask, src_mask, remask_ratio)
 
         # Pass 2 forward
         logits_2 = model(x_t2, t, attention_mask=attention_mask)
         logits_2 = torch.cat([logits_2[:,0:1], logits_2[:,:-1]], dim=1)
 
-        # Compute loss on originally-masked positions (using original x_t mask as loss_mask)
-        # This means model-filled positions from pass 1 that are now unmasked still get loss signal
+        # ============================================================
+        # LOSS (pass 2): already computed over the ENTIRE non-source context,
+        # which matches the spec: loss over everything outside source tokens.
+        #   - src positions    -> masked out (no loss)
+        #   - non-src positions -> all contribute (both "originally-GT-now-argmax"
+        #     positions and "originally-masked" positions)
+        # No change here — just documenting that this is the intended behavior.
+        # ============================================================
         loss_2 = F.cross_entropy(logits_2.reshape(-1, vocab_size), x.reshape(-1), reduction="none").float()
 
         loss_2_mask = ~src_mask
@@ -241,26 +249,44 @@ class CustomDiffusionTrainer(Trainer):
         else:
             return torch.full((batch_size,), float(cfg), device=device)
 
-    def _remask_tokens(self, x_t, logits, sampled_tokens, original_mask, remask_ratio):
+    def _remask_tokens(self, x_t, logits, sampled_tokens, original_mask, src_mask, remask_ratio):
         """
-        Remask lowest-confidence tokens among originally-masked positions.
+        Build pass-2 input and remask lowest-confidence originally-masked positions.
 
-        x_t:           (batch, seq_len) pass-1 input; source tokens at ~original_mask
+        Pass-2 input layout (per user spec):
+          [source tokens unchanged]
+          [originally-GT-unmasked positions -> now argmax tokens from the model]
+          [originally-masked positions      -> argmax tokens from the model]
+          [MASK tokens                       -> re-masked lowest-confidence originally-masked positions]
+
+        x_t:           (batch, seq_len) pass-1 input; MASK at originally-masked positions
         logits:        (batch, seq_len, vocab) from pass 1
         sampled_tokens: argmax samples from pass 1
         original_mask:  bool, True where x_t == mask_token_id
+        src_mask:       bool, True where the position is a source token
         remask_ratio:   (batch,) fraction of originally-masked positions to remask
         """
         probs = F.softmax(logits.detach(), dim=-1)
         sampled_probs = torch.gather(probs, dim=-1, index=sampled_tokens.unsqueeze(-1)).squeeze(-1)
 
-        # Only consider originally masked positions for remasking
+        # Only consider originally masked positions for remasking (unchanged)
         confidence = sampled_probs.clone()
         confidence[~original_mask] = float('inf')  # never remask positions that weren't masked
 
-        # Preserve source tokens from x_t; fill masked positions with pass-1 samples
-        result = x_t.clone()
-        result[original_mask] = sampled_tokens[original_mask]
+        # ============================================================
+        # >>> CHANGE: swap GT with argmax at ALL non-source positions <<<
+        # Previously: only originally-masked positions got argmax; non-source
+        # positions that held ground-truth in x_t were left as ground truth.
+        # Now: every non-source position is filled with the pass-1 argmax
+        # prediction. Source tokens are preserved via `x_t.clone()` because
+        # x_t equals the input at source positions.
+        # ============================================================
+        result = x_t.clone()  # source tokens preserved (x_t == x at src positions)
+        non_src = ~src_mask
+        result[non_src] = sampled_tokens[non_src]
+        # ============================================================
+        # >>> END CHANGE <<<
+        # ============================================================
 
         for b in range(sampled_tokens.shape[0]):
             num_masked = original_mask[b].sum().item()

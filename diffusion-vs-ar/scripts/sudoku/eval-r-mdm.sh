@@ -16,15 +16,16 @@
 export WANDB_DISABLED=true
 export WANDB_PROJECT="diffusion-vs-ar"
 
-sampling=refine
-model=refine
-exp=/nfs/turbo/coe-jjparkcv-medium/satyam/sr/cd5/${model}
-eval=/home/sagoyal/research/mdlm_refine/diffusion-vs-ar/eval_results/cd5/${model}
+sampling=vanilla
+model=refine_2
+task=sudoku
+exp=/nfs/turbo/coe-jjparkcv-medium/satyam/sr/${task}/${model}
+eval=/home/sagoyal/research/mdlm_refine/diffusion-vs-ar/eval_results/${task}/${model}/${sampling}
 
 mkdir -p $exp
 mkdir -p $eval
 
-for dataset in cd5_test
+for dataset in ${task}_test
 do
 topk_decoding=True
 
@@ -32,19 +33,21 @@ CUDA_VISIBLE_DEVICES=0  \
 python3 -u src/train_bash.py \
     --stage mdm --overwrite_output_dir \
     --cache_dir /nfs/turbo/coe-jjparkcv-medium/satyam/.cache \
-    --model_name_or_path model_config \
+    --model_name_or_path model_config_tiny \
     --do_predict \
-    --cutoff_len 64 \
+    --cutoff_len 164 \
     --dataset $dataset \
     --finetuning_type full \
-    --diffusion_steps 20 \
-    --output_dir $eval/${sampling} \
+    --diffusion_steps 2 \
+    --output_dir $eval \
     --checkpoint_dir $exp  \
     --remove_unused_columns False \
     --decoding_strategy deterministic-linear \
     --topk_decoding $topk_decoding \
+    --proseco_budget 1 \
+    --proseco_freq 1 \
     --sampling_method $sampling \
-    --n_correct_per_step 2 \
+    --n_correct_per_step 0 \
     --correct_mode topk \
     --show_mistakes \
     > $eval/eval-TopK$topk_decoding.log

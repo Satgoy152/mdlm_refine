@@ -13,5 +13,11 @@ diffusion-vs-ar/wandb
 diffusion-vs-ar/eval_results
 diffusion-vs-ar/data
 diffusion-vs-ar/cache
+
+
+discrete-diffusion-guidance/eval_results
+discrete-diffusion-guidance/slurm_output
+discrete-diffusion-guidance/*.out
+
 **/__pycache__
 **/*.pyc

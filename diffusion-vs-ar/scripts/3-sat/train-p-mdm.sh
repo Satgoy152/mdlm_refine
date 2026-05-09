@@ -6,7 +6,7 @@
 #SBATCH --gres=gpu:2
 #SBATCH --partition=spgpu2
 #SBATCH --account=jjparkcv_owned1
-#SBATCH --time=24:00:00
+#SBATCH --time=40:00:00
 #SBATCH --mem=40GB
 #SBATCH --cpus-per-task=8
 
@@ -16,14 +16,14 @@ source /home/sagoyal/research/diffusion-vs-ar/.venv/bin/activate
 export WANDB_DISABLED=false
 export WANDB_PROJECT="diffusion-vs-ar-sat"
 
-exp=/nfs/turbo/coe-jjparkcv-medium/satyam/sr/sat/proseco
-eval=/home/sagoyal/research/diffusion-vs-ar/eval_results/sat/proseco
+exp=/nfs/turbo/coe-jjparkcv-medium/satyam/sr/sat/proseco_2
+eval=/home/sagoyal/research/diffusion-vs-ar/eval_results/sat/proseco_2
 
 mkdir -p $exp
 mkdir -p $eval
 
 CUDA_VISIBLE_DEVICES=0,1 \
-accelerate launch --multi_gpu --num_machines 1 --mixed_precision fp16 --num_processes 2 --main_process_port 20099 \
+accelerate launch --multi_gpu --num_machines 1 --mixed_precision fp16 --num_processes 2 --main_process_port 20299 \
 src/train_bash.py \
     --stage mdm --overwrite_output_dir \
     --cache_dir ./cache \
@@ -46,9 +46,10 @@ src/train_bash.py \
     --learning_rate 1e-3 \
     --num_train_epochs 300.0 \
     --plot_loss \
-    --run_name sr_proseco \
+    --run_name sr_proseco_2 \
     --preprocessing_num_workers 8 \
     --fp16 \
+    --report_to wandb \
     --save_total_limit 1 \
     --remove_unused_columns False \
     --diffusion_steps 20 \
@@ -65,24 +66,24 @@ src/train_bash.py \
     --refine_loss_type sum \
     > $exp/train.log
 
-for dataset in 3sat9_test
-do
-topk_decoding=True
-mkdir $exp/$dataset
-CUDA_VISIBLE_DEVICES=1  \
-python3 -u src/train_bash.py \
-    --stage mdm --overwrite_output_dir \
-    --cache_dir ./cache \
-    --model_name_or_path model_config_tiny \
-    --do_predict \
-    --cutoff_len 325 \
-    --dataset $dataset \
-    --finetuning_type full \
-    --diffusion_steps 20 \
-    --output_dir $exp/${dataset} \
-    --checkpoint_dir $exp  \
-    --remove_unused_columns False \
-    --decoding_strategy stochastic0.5-linear \
-    --topk_decoding $topk_decoding \
-    > $exp/${dataset}/eval-TopK$topk_decoding.log
-done
+# for dataset in 3sat9_test
+# do
+# topk_decoding=True
+# mkdir $exp/$dataset
+# CUDA_VISIBLE_DEVICES=1  \
+# python3 -u src/train_bash.py \
+#     --stage mdm --overwrite_output_dir \
+#     --cache_dir ./cache \
+#     --model_name_or_path model_config_tiny \
+#     --do_predict \
+#     --cutoff_len 325 \
+#     --dataset $dataset \
+#     --finetuning_type full \
+#     --diffusion_steps 20 \
+#     --output_dir $exp/${dataset} \
+#     --checkpoint_dir $exp  \
+#     --remove_unused_columns False \
+#     --decoding_strategy stochastic0.5-linear \
+#     --topk_decoding $topk_decoding \
+#     > $exp/${dataset}/eval-TopK$topk_decoding.log
+# done

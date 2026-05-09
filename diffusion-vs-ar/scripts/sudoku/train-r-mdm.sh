@@ -17,8 +17,8 @@ export WANDB_DISABLED=false
 export WANDB_PROJECT="diffusion-vs-ar-sudoku"
 
 
-exp=/nfs/turbo/coe-jjparkcv-medium/satyam/sr/sudoku/refine
-eval=/home/sagoyal/research/diffusion-vs-ar/eval_results/sudoku/refine
+exp=/nfs/turbo/coe-jjparkcv-medium/satyam/sr/sudoku/refine_3
+eval=/home/sagoyal/research/diffusion-vs-ar/eval_results/sudoku/refine_3
 mkdir -p $exp
 mkdir -p $eval
 
@@ -47,7 +47,7 @@ src/train_bash.py \
     --learning_rate 1e-3 \
     --num_train_epochs 300.0 \
     --plot_loss \
-    --run_name sr_refine \
+    --run_name sr_refine_3 \
     --report_to wandb \
     --preprocessing_num_workers 8 \
     --fp16 \
@@ -66,24 +66,24 @@ src/train_bash.py \
     --refine_loss_type sum \
     > $exp/train.log || exit 1
 
-for dataset in sudoku_test
-do
-topk_decoding=True
-mkdir $eval/$dataset
-CUDA_VISIBLE_DEVICES=0  \
-python3 -u src/train_bash.py \
-    --stage mdm --overwrite_output_dir \
-    --cache_dir /nfs/turbo/coe-jjparkcv-medium/satyam/.cache \
-    --model_name_or_path model_config_tiny \
-    --do_predict \
-    --cutoff_len 164 \
-    --dataset $dataset \
-    --finetuning_type full \
-    --diffusion_steps 20 \
-    --output_dir $exp/${dataset} \
-    --checkpoint_dir $exp  \
-    --remove_unused_columns False \
-    --decoding_strategy stochastic0.5-linear \
-    --topk_decoding $topk_decoding \
-    > $eval/${dataset}/eval-TopK$topk_decoding.log
-done
+# for dataset in sudoku_test
+# do
+# topk_decoding=True
+# mkdir $eval/$dataset
+# CUDA_VISIBLE_DEVICES=0  \
+# python3 -u src/train_bash.py \
+#     --stage mdm --overwrite_output_dir \
+#     --cache_dir /nfs/turbo/coe-jjparkcv-medium/satyam/.cache \
+#     --model_name_or_path model_config_tiny \
+#     --do_predict \
+#     --cutoff_len 164 \
+#     --dataset $dataset \
+#     --finetuning_type full \
+#     --diffusion_steps 20 \
+#     --output_dir $exp/${dataset} \
+#     --checkpoint_dir $exp  \
+#     --remove_unused_columns False \
+#     --decoding_strategy stochastic0.5-linear \
+#     --topk_decoding $topk_decoding \
+#     > $eval/${dataset}/eval-TopK$topk_decoding.log
+# done

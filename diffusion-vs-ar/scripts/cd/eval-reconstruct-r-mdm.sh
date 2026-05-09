@@ -12,31 +12,41 @@
 
 export WANDB_DISABLED=true
 
-exp=/nfs/turbo/coe-jjparkcv-medium/satyam/sr/cd5/refine
-eval=/home/sagoyal/research/mdlm_refine/diffusion-vs-ar/eval_results/reconstruct/cd5/refine
+task=cd5
+sampling=refine
+model=refine
+exp=/nfs/turbo/coe-jjparkcv-medium/satyam/sr/${task}/${model}
+eval=/home/sagoyal/research/mdlm_refine/diffusion-vs-ar/eval_results/${task}/${model}
 mkdir -p $eval
 
-dataset=sudoku_test
+samples=1000
+steps=8
+
+dataset=${task}_test
 input_file=/home/sagoyal/research/mdlm_refine/diffusion-vs-ar/data/${dataset}.jsonl
 
 CUDA_VISIBLE_DEVICES=0 \
 python3 -u eval_reconstruct.py \
-    --model_name_or_path model_config_tiny \
+    --model_name_or_path model_config \
     --checkpoint_dir $exp \
     --cache_dir /nfs/turbo/coe-jjparkcv-medium/satyam/.cache \
     --input_file $input_file \
     --dataset $dataset \
-    --cutoff_len 164 \
-    --sampler refine \
-    --diffusion_steps 4 \
-    --mask_frac 0.25 \
-    --corrupt_frac 0.25 \
-    --n_samples 1 \
-    --eval_batch_size 10 \
-    --n_correct_per_step 5 \
+    --cutoff_len 45 \
+    --sampler $sampling \
+    --topk_decoding \
+    --decoding_strategy deterministic-linear \
+    --diffusion_steps $steps \
+    --mask_frac 0.33 \
+    --corrupt_frac 0.33 \
+    --n_samples $samples \
+    --eval_batch_size 20 \
+    --n_correct_per_step 16 \
     --correct_mode topk \
+    --seed 45 \
+    --verbose \
     --proseco_budget 1 \
     --proseco_freq 1 \
     --save_gen_dir $eval/gen \
     --save_res_dir $eval/res \
-    > $eval/${dataset}_refine_steps4.log
+    2>&1 | tee $eval/${sampling}/samples${samples}_steps${steps}.log
