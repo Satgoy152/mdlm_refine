@@ -664,8 +664,8 @@ class Diffusion(L.LightningModule):
           time_conditioning=time_conditioning, cond=cond, t=t)
         w1, w2 = self._refine_get_loss_scales(
           getattr(self.config.training, 'refine_loss_type', 'sum'))
-        
-        return pass1_per_token * w1 + loss2_per_token * w2
+        mdlm_weight = (dsigma / torch.expm1(sigma))[:, None]
+        return pass1_per_token * w1 + loss2_per_token * mdlm_weight * w2
 
       if self.training and self.config.training.use_simple_ce_loss:
         return {
