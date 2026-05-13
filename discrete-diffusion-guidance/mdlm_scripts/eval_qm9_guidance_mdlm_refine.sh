@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --job-name=eval_qm9_mdlm_refine
-#SBATCH --output=slurm_output/eval_qm9_mdlm_refine.out
-#SBATCH --error=slurm_output/eval_qm9_mdlm_refine.err
+#SBATCH --job-name=eval_qm9_guidance_mdlm_refine
+#SBATCH --output=slurm_output/eval_qm9_guidance_mdlm_refine.out
+#SBATCH --error=slurm_output/eval_qm9_guidance_mdlm_refine.err
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:1
 #SBATCH --ntasks-per-node=1
@@ -11,9 +11,10 @@
 #SBATCH --mem=32GB
 #SBATCH --cpus-per-task=4
 
-# Submit with: sbatch eval_qm9_mdlm_refine.sh
+# Submit with: sbatch --export=ALL,PROP=<qed|ring_count>[,GAMMA=<float>] eval_qm9_guidance_mdlm_refine.sh
 # Optional overrides:
-#   PROP=<qed|ring_count>  (default: qed) - property to compute stats for
+#   PROP=<qed|ring_count>  (default: qed) - property checkpoint was trained on
+#   GAMMA=<float>          (default: 1.0) - CFG guidance scale (0 = unconditional)
 #   SAMPLING_STEPS=<int>   (default: 32)
 #   SEED=<int>             (default: 1)
 
@@ -21,23 +22,20 @@ export HF_HOME=/nfs/turbo/coe-jjparkcv-medium/satyam/.cache/huggingface
 export HYDRA_FULL_ERROR=1
 export WANDB_DISABLED=true
 
-# source /home/sagoyal/research/mdlm_refine/discrete-diffusion-guidance/.venv/bin/activate
-# cd /home/sagoyal/research/mdlm_refine/discrete-diffusion-guidance || exit 1
+MODEL=refine
+PROP="${PROP:-qed}"
+GAMMA="${GAMMA:-1.0}"
+SAMPLING_STEPS="${SAMPLING_STEPS:-32}"
+SEED="${SEED:-1}"
 
-OUTPUT_DIR_BASE=/nfs/turbo/coe-jjparkcv-medium/satyam/molecule_gen/proseco
-RUN_NAME=mdlm_no-guidance_proseco
+OUTPUT_DIR_BASE=/nfs/turbo/coe-jjparkcv-medium/satyam/molecule_gen/
+RUN_NAME=mdlm_${PROP}_${MODEL}
 DATA_CACHE_DIR=/nfs/turbo/coe-jjparkcv-medium/satyam/.cache
 CKPT="${OUTPUT_DIR_BASE}/${RUN_NAME}"
 RES="./eval_results"
 
-PROP="${PROP:-qed}"
-SAMPLING_STEPS="${SAMPLING_STEPS:-32}"
-SEED="${SEED:-1}"
-
-# Unconditional sampling via CFG with gamma=0.0
-# (collapses to unconditional logits in diffusion.py)
-results_csv_path="${RES}/qm9-eval-uncond_${PROP}_T-${SAMPLING_STEPS}_seed-${SEED}.csv"
-generated_seqs_path="${RES}/samples-qm9-eval-uncond_${PROP}_T-${SAMPLING_STEPS}_seed-${SEED}.json"
+results_csv_path="${RES}/qm9-eval-cfg_${MODEL}_${PROP}_g-${GAMMA}_T-${SAMPLING_STEPS}_seed-${SEED}.csv"
+generated_seqs_path="${RES}/samples-qm9-eval-cfg_${MODEL}_${PROP}_g-${GAMMA}_T-${SAMPLING_STEPS}_seed-${SEED}.json"
 
 PYTHONPATH=. python -u guidance_eval/qm9_eval.py \
     hydra.output_subdir=null \
@@ -59,7 +57,10 @@ PYTHONPATH=. python -u guidance_eval/qm9_eval.py \
     diffusion=absorbing_state \
     time_conditioning=False \
     T=0 \
-    training.guidance=null \
+    guidance=cfg \
+    guidance.condition=1 \
+    guidance.gamma=${GAMMA} \
+    training.guidance.cond_dropout=0.1 \
     training.refine=True \
     training.proseco=False \
     training.refine_remask_ratio=t \
@@ -71,6 +72,10 @@ PYTHONPATH=. python -u guidance_eval/qm9_eval.py \
     sampling.num_sample_batches=64 \
     sampling.batch_size=16 \
     sampling.steps=${SAMPLING_STEPS} \
-    sampling.use_cache=True \
+    sampling.use_cache=False \
+    sampling.method=vanilla \
+    sampling.n_correct_per_step=32 \
+    sampling.correct_mode=topk \
+    sampling.correct_threshold=0.01 \
     +eval.results_csv_path=${results_csv_path} \
     eval.generated_samples_path=${generated_seqs_path}

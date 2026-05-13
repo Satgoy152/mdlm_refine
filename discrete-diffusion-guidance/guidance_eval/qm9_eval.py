@@ -193,6 +193,7 @@ def main(config: omegaconf.DictConfig) -> None:
         f"\tNovel {label_col.upper()} Mean: {np.mean(mol_property_novel) if len(mol_property_novel) else 0.:0.3f}, Novel {label_col.upper()} Median: {np.median(mol_property_novel) if len(mol_property_novel) else 0.:0.3f}"
         )
   print(f"Generated {len(samples)} sentences.")
+  os.makedirs(os.path.dirname(config.eval.generated_samples_path) or '.', exist_ok=True)
   with open(config.eval.generated_samples_path, 'w') as f:
     json.dump(
       {

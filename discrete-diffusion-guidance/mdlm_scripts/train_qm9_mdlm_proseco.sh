@@ -22,7 +22,7 @@ export HYDRA_FULL_ERROR=1
 source /home/sagoyal/research/mdlm_refine/discrete-diffusion-guidance/.venv/bin/activate
 # cd /home/sagoyal/research/mdlm_refine/discrete-diffusion-guidance || exit 1
 
-OUTPUT_DIR_BASE=/nfs/turbo/coe-jjparkcv-medium/satyam/molecule_gen/proseco
+OUTPUT_DIR_BASE=/nfs/turbo/coe-jjparkcv-medium/satyam/molecule_gen/
 RUN_NAME=mdlm_no-guidance_proseco
 DATA_CACHE_DIR=/nfs/turbo/coe-jjparkcv-medium/satyam/.cache
 

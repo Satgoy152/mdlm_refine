@@ -1,9 +1,9 @@
 #!/bin/bash
-#SBATCH --job-name=train_qm89_mdlm_refine
-#SBATCH --output=slurm_output/train_qm89_mdlm_refine.out
-#SBATCH --error=slurm_output/train_qm89_mdlm_refine.err
+#SBATCH --job-name=train_qm89_mdlm_refine_4
+#SBATCH --output=slurm_output/train_qm89_mdlm_refine_4.out
+#SBATCH --error=slurm_output/train_qm89_mdlm_refine_4.err
 #SBATCH --nodes=1
-#SBATCH --gres=gpu:2
+#SBATCH --gres=gpu:4
 #SBATCH --ntasks-per-node=1
 #SBATCH --partition=spgpu2
 #SBATCH --account=jjparkcv_owned1
@@ -22,8 +22,8 @@ export HYDRA_FULL_ERROR=1
 source /home/sagoyal/research/mdlm_refine/discrete-diffusion-guidance/.venv/bin/activate
 # cd /home/sagoyal/research/mdlm_refine/discrete-diffusion-guidance || exit 1
 
-OUTPUT_DIR_BASE=/nfs/turbo/coe-jjparkcv-medium/satyam/molecule_gen/refine
-RUN_NAME=mdlm_no-guidance_refine_2
+OUTPUT_DIR_BASE=/nfs/turbo/coe-jjparkcv-medium/satyam/molecule_gen/
+RUN_NAME=mdlm_no-guidance_refine_5
 DATA_CACHE_DIR=/nfs/turbo/coe-jjparkcv-medium/satyam/.cache
 
 

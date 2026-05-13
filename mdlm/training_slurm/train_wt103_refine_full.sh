@@ -15,7 +15,7 @@ echo "CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES"
 
 
 # Activate your venv
-source /home/sagoyal/research/mdlm/.venv/bin/activate
+source /home/sagoyal/research/mdlm_refine/mdlm/.venv/bin/activate
 
 python main.py \
   mode=train_eval \

@@ -393,19 +393,34 @@ class Diffusion(L.LightningModule):
     return result
 
   def _refine_pass2_loss(self, x0, xt, log_probs_pass1,
-                         time_conditioning, cond, t):
+                       time_conditioning, cond, t,
+                       raw_logits_pass1=None):
     """Run pass 2 and return per-token CE loss (B, L).
 
-    The backbone is called directly (bypassing SUBS 'copy-over')
-    so the model receives gradient at every position — including
-    positions where pass-1's argmax was wrong.
+    refine_2 (default): pass-2 input at unmasked positions is the
+    original token (SUBS argmax is a no-op there).
+    refine_3: pass-2 input at unmasked positions is sampled from
+    the model's raw logits, so it can differ from xt.
     """
     temperature = float(getattr(
       self.config.training, 'refine_temperature', 0.0))
+    use_refine_3 = True
 
     with torch.no_grad():
+      if use_refine_3:
+        assert raw_logits_pass1 is not None, (
+          "refine_3=True requires raw_logits_pass1.")
+        # Sample from raw logits (mask suppressed, but no SUBS
+        # copy-over). At unmasked positions, the argmax/Gumbel-argmax
+        # is the model's prediction, not xt.
+        raw_for_sample = raw_logits_pass1.clone()
+        raw_for_sample[..., self.mask_index] += self.neg_infinity
+        log_probs_for_sample = raw_for_sample.log_softmax(dim=-1)
+      else:
+        log_probs_for_sample = log_probs_pass1
+
       noisy_log_probs = self._refine_add_gumbel_noise(
-        log_probs_pass1, temperature)
+        log_probs_for_sample, temperature)
       sampled_tokens = noisy_log_probs.argmax(dim=-1)
 
     batch_size = x0.size(0)
@@ -413,7 +428,7 @@ class Diffusion(L.LightningModule):
       t, batch_size, x0.device)
     original_mask = (xt == self.mask_index)
     xt2 = self._refine_remask_tokens(
-      log_probs_pass1, sampled_tokens, original_mask, remask_ratio)
+      log_probs_for_sample, sampled_tokens, original_mask, remask_ratio)
 
     sigma_processed = self._process_sigma(time_conditioning)
     with torch.cuda.amp.autocast(dtype=torch.float32):
@@ -602,8 +617,13 @@ class Diffusion(L.LightningModule):
       move_chance = 1 - torch.exp(-sigma[:, None])
 
     xt = self._q_xt(x0, move_chance)
-    model_output = self.forward(xt, time_conditioning,
-                                cond=cond)
+    # model_output = self.forward(xt, time_conditioning,
+    #                             cond=cond)
+    sigma_processed = self._process_sigma(time_conditioning)
+    with torch.cuda.amp.autocast(dtype=torch.float32):
+        raw_logits_pass1 = self.backbone(xt, sigma_processed, cond)
+    # SUBS for pass-1 loss (mutates a clone, leaves raw_logits intact)
+    model_output = self._subs_parameterization(raw_logits_pass1.clone(), xt)
 
     # Discrete (finite T) time
     if self.T > 0:
@@ -660,8 +680,10 @@ class Diffusion(L.LightningModule):
           or getattr(self.config.training, 'proseco', False))
       if refine_enabled:
         loss2_per_token = self._refine_pass2_loss(
-          x0=x0, xt=xt, log_probs_pass1=model_output,
-          time_conditioning=time_conditioning, cond=cond, t=t)
+                          x0=x0, xt=xt,
+                          log_probs_pass1=model_output,
+                          time_conditioning=time_conditioning, cond=cond, t=t,
+                          raw_logits_pass1=raw_logits_pass1)
         w1, w2 = self._refine_get_loss_scales(
           getattr(self.config.training, 'refine_loss_type', 'sum'))
         mdlm_weight = (dsigma / torch.expm1(sigma))[:, None]
@@ -1022,9 +1044,21 @@ class Diffusion(L.LightningModule):
       samples = self._ar_sample(
         classifier_model=classifier_model, cond=cond)
     else:  # Diffusion sampling
-      samples = self._diffusion_sample(
-        classifier_model=classifier_model, cond=cond,
-        eps=eps)
+      method = getattr(self.config.sampling, 'method', 'vanilla')
+      if method != 'vanilla' and (
+          self.diffusion != 'absorbing_state'
+          or getattr(self.config, 'guidance', None) is not None):
+        raise NotImplementedError(
+          f"sampling.method={method} only supports unconditional "
+          "absorbing_state diffusion.")
+      if method == 'refine':
+        samples = self._diffusion_sample_refine(eps=eps)
+      elif method == 'proseco':
+        samples = self._diffusion_sample_proseco(eps=eps)
+      else:
+        samples = self._diffusion_sample(
+          classifier_model=classifier_model, cond=cond,
+          eps=eps)
     if not self.config.eval.disable_ema:
       self._restore_non_ema_params()
     return samples
@@ -1365,6 +1399,199 @@ class Diffusion(L.LightningModule):
       xs = torch.where(copy_flag, xt, xs)
 
     return xs, q_xs, {'log_x_theta': log_x_theta}
+
+  @torch.no_grad()
+  def _diffusion_sample_refine(self, eps: float = 1e-5):
+    """Single-pass DDPM + correction sampler for refine MDLM.
+
+    Each step makes ONE backbone call. The raw logits are used:
+      (a) under SUBS for DDPM unmasking of currently-masked positions, and
+      (b) directly (no SUBS) to propose corrections at positions that were
+          unmasked BEFORE this step. Newly unmasked positions are NOT
+          corrected (their raw logits were computed when they were masked).
+    """
+    assert self.diffusion == 'absorbing_state'
+    bs = self.config.sampling.batch_size
+    L = self.config.model.length
+    n_correct = int(getattr(self.config.sampling, 'n_correct_per_step', 0))
+    correct_mode = getattr(self.config.sampling, 'correct_mode', 'topk')
+    correct_threshold = float(getattr(
+      self.config.sampling, 'correct_threshold', 0.0))
+
+    xt = self._sample_prior(bs, L).to(self.device)
+    timesteps = torch.linspace(
+      1, eps, self.config.sampling.steps + 1, device=self.device)
+    dt = (1 - eps) / self.config.sampling.steps
+
+    pbar = tqdm(range(self.config.sampling.steps),
+                desc='Refine sampling', leave=False)
+    for i in pbar:
+      t = timesteps[i] * torch.ones(bs, 1, device=self.device)
+      sigma_t, _ = self.noise(t)
+      sigma_s, _ = self.noise(t - dt)
+      if sigma_t.ndim > 1: sigma_t = sigma_t.squeeze(-1)
+      if sigma_s.ndim > 1: sigma_s = sigma_s.squeeze(-1)
+      move_chance_t = (1 - torch.exp(-sigma_t))[:, None, None]
+      move_chance_s = (1 - torch.exp(-sigma_s))[:, None, None]
+
+      sigma_processed = self._process_sigma(sigma_t)
+      with torch.cuda.amp.autocast(dtype=torch.float32):
+        raw_logits = self.backbone(xt, sigma_processed, None)
+      if self.config.sampling.use_float64:
+        raw_logits = raw_logits.to(torch.float64)
+
+      # SUBS parameterization for DDPM step
+      subs_logits = raw_logits.clone()
+      subs_logits[:, :, self.mask_index] += self.neg_infinity
+      subs_logits = subs_logits - torch.logsumexp(
+        subs_logits, dim=-1, keepdim=True)
+      unmasked_indices = (xt != self.mask_index)
+      subs_logits[unmasked_indices] = self.neg_infinity
+      subs_logits[unmasked_indices, xt[unmasked_indices]] = 0
+
+      previously_unmasked = unmasked_indices
+
+      # DDPM posterior sampling
+      x_theta = subs_logits.exp()
+      q_xs = x_theta * (move_chance_t - move_chance_s)
+      q_xs[:, :, self.mask_index] = move_chance_s[:, :, 0]
+      q_xs /= move_chance_t
+      _x = _sample_categorical(q_xs)
+      copy_flag = previously_unmasked.to(xt.dtype)
+      xt = (copy_flag * xt + (1 - copy_flag) * _x).long()
+
+      # Correction phase: reuse raw_logits at previously-unmasked positions
+      if n_correct > 0:
+        corr_logits = raw_logits.clone()
+        corr_logits[:, :, self.mask_index] += self.neg_infinity
+        log_probs = corr_logits - torch.logsumexp(
+          corr_logits, dim=-1, keepdim=True)
+        det_candidates = log_probs.argmax(dim=-1)
+
+        for b in range(bs):
+          unmasked_pos = previously_unmasked[b].nonzero(
+            as_tuple=True)[0]
+          if unmasked_pos.numel() == 0:
+            continue
+          changed = det_candidates[b][unmasked_pos] != xt[b][unmasked_pos]
+          cand_pos = unmasked_pos[changed]
+          if cand_pos.numel() == 0:
+            continue
+          log_p_new = log_probs[b][cand_pos, det_candidates[b][cand_pos]]
+          log_p_cur = log_probs[b][cand_pos, xt[b][cand_pos]]
+          log_ratio = log_p_new - log_p_cur
+
+          if correct_mode == 'topk':
+            k = min(n_correct, cand_pos.numel())
+            _, top_idx = log_ratio.topk(k, largest=True)
+            accept_pos = cand_pos[top_idx]
+          elif correct_mode == 'threshold':
+            accept_pos = cand_pos[log_ratio > correct_threshold]
+          else:
+            raise ValueError(
+              f"Unknown sampling.correct_mode: {correct_mode}")
+          xt[b, accept_pos] = det_candidates[b, accept_pos]
+
+    # Final denoising pass
+    t_final = timesteps[-1] * torch.ones(bs, 1, device=self.device)
+    sigma_final, _ = self.noise(t_final)
+    if sigma_final.ndim > 1:
+      sigma_final = sigma_final.squeeze(-1)
+    xt = self.forward(xt, sigma_final, cond=None).argmax(dim=-1)
+    return xt
+
+  @torch.no_grad()
+  def _diffusion_sample_proseco(self, eps: float = 1e-5):
+    """ProSeCo sampler: MDLM unmasking with periodic self-correction.
+
+    Total NFE budget is `sampling.steps`. Each outer step costs 1 NFE for
+    unmasking; every `proseco_freq` outer steps we run `proseco_budget`
+    corrector forward passes on a dense argmax sequence (no masks).
+    actual_outer_steps = steps * omega / (omega + S).
+    """
+    assert self.diffusion == 'absorbing_state'
+    bs = self.config.sampling.batch_size
+    L = self.config.model.length
+    omega = int(getattr(self.config.sampling, 'proseco_freq', 1))
+    S = int(getattr(self.config.sampling, 'proseco_budget', 0))
+    corrector_sampling = getattr(
+      self.config.sampling, 'corrector_sampling', 'argmax')
+
+    actual_steps = int(self.config.sampling.steps / (1 + (S / omega))) \
+      if (omega + S) > 0 else self.config.sampling.steps
+    actual_steps = max(actual_steps, 1)
+
+    xt = self._sample_prior(bs, L).to(self.device)
+    timesteps = torch.linspace(
+      1, eps, actual_steps + 1, device=self.device)
+    dt = (1 - eps) / actual_steps
+
+    pbar = tqdm(range(actual_steps),
+                desc='ProSeCo sampling', leave=False)
+    for i in pbar:
+      t = timesteps[i] * torch.ones(bs, 1, device=self.device)
+      sigma_t, _ = self.noise(t)
+      sigma_s, _ = self.noise(t - dt)
+      if sigma_t.ndim > 1: sigma_t = sigma_t.squeeze(-1)
+      if sigma_s.ndim > 1: sigma_s = sigma_s.squeeze(-1)
+      move_chance_t = (1 - torch.exp(-sigma_t))[:, None, None]
+      move_chance_s = (1 - torch.exp(-sigma_s))[:, None, None]
+
+      log_x_theta = self.forward(xt, sigma_t, cond=None)
+      if self.config.sampling.use_float64:
+        log_x_theta = log_x_theta.to(torch.float64)
+
+      # ProSeCo corrector phase
+      if S > 0 and (i + 1) % omega == 0:
+        corrector_x = log_x_theta.argmax(dim=-1)
+        sigma_processed = self._process_sigma(sigma_t)
+        for _s in range(S):
+          with torch.cuda.amp.autocast(dtype=torch.float32):
+            corr_logits = self.backbone(corrector_x, sigma_processed, None)
+          corr_logits[..., self.mask_index] += self.neg_infinity
+          corr_log = corr_logits.log_softmax(dim=-1)
+          if self.config.sampling.use_float64:
+            corr_log = corr_log.to(torch.float64)
+          corrector_x = self._proseco_select(
+            corr_log, corrector_x, corrector_sampling)
+
+        unmasked = (xt != self.mask_index)
+        xt = torch.where(unmasked, corrector_x, xt)
+        log_x_theta = corr_log
+
+      # DDPM posterior sampling step
+      x_theta = log_x_theta.exp()
+      q_xs = x_theta * (move_chance_t - move_chance_s)
+      q_xs[:, :, self.mask_index] = move_chance_s[:, :, 0]
+      _x = _sample_categorical(q_xs)
+      copy_flag = (xt != self.mask_index)
+      xt = torch.where(copy_flag, xt, _x)
+
+    # Final denoising pass
+    t_final = timesteps[-1] * torch.ones(bs, 1, device=self.device)
+    sigma_final, _ = self.noise(t_final)
+    if sigma_final.ndim > 1:
+      sigma_final = sigma_final.squeeze(-1)
+    xt = self.forward(xt, sigma_final, cond=None).argmax(dim=-1)
+    return xt
+
+  def _proseco_select(self, log_x_theta, corrector_x, method):
+    """Select tokens from corrector logits per spec."""
+    if method == 'argmax':
+      return log_x_theta.argmax(dim=-1)
+    if method == 'topk':
+      k = 100
+      argmax_tokens = log_x_theta.argmax(dim=-1)
+      argmax_conf = log_x_theta.max(dim=-1).values
+      unchanged = (argmax_tokens == corrector_x)
+      argmax_conf = argmax_conf.masked_fill(unchanged, float('-inf'))
+      seq_len = argmax_conf.shape[-1]
+      k_clamped = min(k, seq_len)
+      _, topk_pos = argmax_conf.topk(k_clamped, dim=-1)
+      mask = torch.zeros_like(argmax_conf, dtype=torch.bool)
+      mask.scatter_(-1, topk_pos, True)
+      return torch.where(mask, argmax_tokens, corrector_x)
+    raise ValueError(f"Unknown corrector_sampling: {method}")
 
   def _cfg_denoise(
       self,

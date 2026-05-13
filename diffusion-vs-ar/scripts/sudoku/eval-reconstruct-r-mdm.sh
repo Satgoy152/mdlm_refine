@@ -12,12 +12,15 @@
 
 export WANDB_DISABLED=true
 
-exp=/nfs/turbo/coe-jjparkcv-medium/satyam/sr/sudoku/refine
-eval=/home/sagoyal/research/mdlm_refine/diffusion-vs-ar/eval_results/reconstruct/sudoku/refine
+sampling=vanilla
+model=refine_2
+task=sudoku
+exp=/nfs/turbo/coe-jjparkcv-medium/satyam/sr/${task}/${model}
+eval=/home/sagoyal/research/mdlm_refine/diffusion-vs-ar/eval_results/reconstruct/${task}/${model}
 mkdir -p $eval
 
-dataset=sudoku_test
-input_file=/home/sagoyal/research/mdlm_refine/diffusion-vs-ar/data/${dataset}.jsonl
+dataset=${task}_test
+input_file=/home/sagoyal/research/mdlm_refine/diffusion-vs-ar/data/${dataset}.csv
 
 CUDA_VISIBLE_DEVICES=0 \
 python3 -u eval_reconstruct.py \
@@ -27,7 +30,7 @@ python3 -u eval_reconstruct.py \
     --input_file $input_file \
     --dataset $dataset \
     --cutoff_len 164 \
-    --sampler refine \
+    --sampler $sampling \
     --diffusion_steps 4 \
     --mask_frac 0.25 \
     --corrupt_frac 0.25 \

@@ -12,18 +12,18 @@
 
 export WANDB_DISABLED=true
 
-task=cd5
-sampling=refine
-model=refine
+task=sudoku
+sampling=proseco
+model=proseco
 exp=/nfs/turbo/coe-jjparkcv-medium/satyam/sr/${task}/${model}
 eval=/home/sagoyal/research/mdlm_refine/diffusion-vs-ar/eval_results/${task}/${model}
 mkdir -p $eval
 
 samples=1000
-steps=8
+steps=2
 
 dataset=${task}_test
-input_file=/home/sagoyal/research/mdlm_refine/diffusion-vs-ar/data/${dataset}.jsonl
+input_file=/home/sagoyal/research/mdlm_refine/diffusion-vs-ar/data/${dataset}.csv
 
 CUDA_VISIBLE_DEVICES=0 \
 python3 -u eval_reconstruct.py \
@@ -32,13 +32,13 @@ python3 -u eval_reconstruct.py \
     --cache_dir /nfs/turbo/coe-jjparkcv-medium/satyam/.cache \
     --input_file $input_file \
     --dataset $dataset \
-    --cutoff_len 45 \
+    --cutoff_len 164 \
     --sampler $sampling \
     --topk_decoding \
     --decoding_strategy deterministic-linear \
     --diffusion_steps $steps \
-    --mask_frac 0.33 \
-    --corrupt_frac 0.33 \
+    --mask_frac 0.0 \
+    --corrupt_frac 1.0 \
     --n_samples $samples \
     --eval_batch_size 20 \
     --n_correct_per_step 16 \

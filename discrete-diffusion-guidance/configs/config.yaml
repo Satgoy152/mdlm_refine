@@ -39,6 +39,16 @@ sampling:
   batch_size: ${loader.eval_batch_size}
   num_sample_batches: 2  # Total samples: `num_gpus` * `batch_size` * `num_sample_batches`
   use_float64: False
+  # --- Inference-time sampling method (absorbing_state diffusion only) ---
+  method: vanilla            # 'vanilla' | 'refine' | 'proseco'
+  # Refine sampler params
+  n_correct_per_step: 50     # max corrections per step (0 = vanilla)
+  correct_mode: topk         # 'topk' | 'threshold'
+  correct_threshold: 0.01    # min log p(new) - log p(cur) to accept (threshold mode)
+  # ProSeCo sampler params
+  proseco_budget: 3          # S: corrector forward passes per correction round
+  proseco_freq: 1            # omega: run corrector every omega outer steps
+  corrector_sampling: argmax # 'argmax' | 'topk'
 
 training:
   ema: 0.9999

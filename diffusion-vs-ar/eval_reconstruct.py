@@ -28,6 +28,7 @@ import os
 import sys
 import random
 import statistics
+import csv
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'src'))
 
@@ -408,18 +409,34 @@ def load_mdm(args, device):
 
 # ── Data loading ─────────────────────────────────────────────────────────────
 
-def load_task_jsonl(path, n_samples):
+# ── Data loading ─────────────────────────────────────────────────────────────
+
+def load_task_file(path, n_samples):
     samples = []
-    with open(path) as f:
-        for line in f:
-            if not line.strip():
-                continue
-            obj = json.loads(line)
-            prompt = obj.get('input') or obj.get('prompt') or ''
-            response = obj.get('output') or obj.get('response') or ''
-            samples.append((prompt, response))
-            if len(samples) >= n_samples:
-                break
+    is_csv = path.lower().endswith('.csv')
+    
+    with open(path, 'r', encoding='utf-8') as f:
+        if is_csv:
+            reader = csv.reader(f)
+            for row in reader:
+                if not row:
+                    continue
+                # Use column 0 for input, column 1 for solution
+                prompt = row[0] if len(row) > 0 else ''
+                response = row[1] if len(row) > 1 else ''
+                samples.append((prompt, response))
+                if len(samples) >= n_samples:
+                    break
+        else:
+            for line in f:
+                if not line.strip():
+                    continue
+                obj = json.loads(line)
+                prompt = obj.get('input') or obj.get('prompt') or ''
+                response = obj.get('output') or obj.get('response') or ''
+                samples.append((prompt, response))
+                if len(samples) >= n_samples:
+                    break
     return samples
 
 
@@ -565,7 +582,7 @@ def main():
     print(f'Sampler={args.sampler}  steps={args.diffusion_steps}  batch_size={batch_size}')
     print(f'mask_frac={args.mask_frac}  corrupt_frac={args.corrupt_frac}')
 
-    samples = load_task_jsonl(args.input_file, args.n_samples)
+    samples = load_task_file(args.input_file, args.n_samples)
     print(f'Loaded {len(samples)} samples from {args.input_file}')
 
     rng = random.Random(args.seed)
