@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --job-name=train_mdlm_refine_presco
-#SBATCH --output=slurm_output/train_mdlm_refine_full.out
-#SBATCH --error=slurm_output/train_mdlm_refine_full.err
+#SBATCH --job-name=train_mdlm_refine5
+#SBATCH --output=slurm_output/train_mdlm_refine5_full.out
+#SBATCH --error=slurm_output/train_mdlm_refine5_full.err
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:4
 #SBATCH --partition=spgpu2
@@ -28,8 +28,8 @@ python main.py \
   checkpointing.resume_ckpt_path="/home/sagoyal/research/mdlm_refine/mdlm/checkpoints/mdlm.ckpt" \
   parameterization=subs \
   model.length=1024 \
-  wandb.name=refine_1 \
-  wandb.id="refine_1_$(date +%Y%m%d_%H%M%S)" \
+  wandb.name=refine_5 \
+  wandb.id="refine_5_$(date +%Y%m%d_%H%M%S)" \
   loader.eval_batch_size=8 \
   loader.global_batch_size=64 \
   sampling.steps=1000 \
@@ -37,9 +37,9 @@ python main.py \
   trainer.val_check_interval=1000 \
   trainer.max_steps=1172551 \
   training.refine=True \
-  training.refine_variant=refine_1 \
+  training.refine_variant=refine_5 \
   training.remask_ratio='t' \
   training.loss_type="alpha" \
   training.alpha=0.5 \
   checkpointing.save_dir=/nfs/turbo/coe-jjparkcv-medium/satyam/mdlm/refine \
-  
+

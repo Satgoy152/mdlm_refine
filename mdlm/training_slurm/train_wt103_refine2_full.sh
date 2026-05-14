@@ -1,19 +1,19 @@
 #!/bin/bash
-#SBATCH --job-name=train_mdlm_refine_presco
-#SBATCH --output=slurm_output/train_mdlm_refine_full.out
-#SBATCH --error=slurm_output/train_mdlm_refine_full.err
+#SBATCH --job-name=train_mdlm_refine2
+#SBATCH --output=slurm_output/train_mdlm_refine2_full.out
+#SBATCH --error=slurm_output/train_mdlm_refine2_full.err
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:4
 #SBATCH --partition=spgpu2
 #SBATCH --account=jjparkcv_owned1
-#SBATCH --time=24:00:00
-#SBATCH --mem=40GB
+#SBATCH --time=48:00:00
+#SBATCH --mem=80GB
 #SBATCH --cpus-per-task=16
 
 nvidia-smi
 echo "CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES"
 
-
+variant=refine_2
 # Activate your venv
 source /home/sagoyal/research/mdlm_refine/mdlm/.venv/bin/activate
 
@@ -28,18 +28,18 @@ python main.py \
   checkpointing.resume_ckpt_path="/home/sagoyal/research/mdlm_refine/mdlm/checkpoints/mdlm.ckpt" \
   parameterization=subs \
   model.length=1024 \
-  wandb.name=refine_1 \
-  wandb.id="refine_1_$(date +%Y%m%d_%H%M%S)" \
+  wandb.name=${variant} \
+  wandb.id="${variant}_$(date +%Y%m%d_%H%M%S)" \
   loader.eval_batch_size=8 \
-  loader.global_batch_size=64 \
+  loader.global_batch_size=48 \
   sampling.steps=1000 \
   loader.num_workers=2 \
   trainer.val_check_interval=1000 \
   trainer.max_steps=1172551 \
   training.refine=True \
-  training.refine_variant=refine_1 \
+  training.refine_variant=${variant} \
   training.remask_ratio='t' \
   training.loss_type="alpha" \
   training.alpha=0.5 \
-  checkpointing.save_dir=/nfs/turbo/coe-jjparkcv-medium/satyam/mdlm/refine \
-  
+  checkpointing.save_dir=/nfs/turbo/coe-jjparkcv-medium/satyam/mdlm/${variant} \
+

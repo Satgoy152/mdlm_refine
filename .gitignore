@@ -7,6 +7,7 @@ mdlm/eval
 mdlm/checkpoints
 mdlm/__pycache__
 mdlm/.env
+mdlm/outputs
 
 diffusion-vs-ar/slurm_output
 diffusion-vs-ar/wandb

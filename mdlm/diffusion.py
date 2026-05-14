@@ -921,29 +921,51 @@ class Diffusion(L.LightningModule):
     if self.config.training.refine:
       loss_1 = -log_p_theta * (dsigma / torch.expm1(sigma))[:, None]
 
-      with torch.no_grad():
-          logits_with_noise = self.add_gumbel_noise(model_output, temperature=self.config.training.temperature)
-          sampled_tokens = logits_with_noise.argmax(dim=-1)
-      
+      refine_variant = getattr(
+        self.config.training, 'refine_variant', 'refine_1')
 
-      if self.config.training.remask_ratio == "random":
-        remask_ratio = torch.rand(move_chance.shape[0], device=move_chance.device)
-      elif self.config.training.remask_ratio == "t":
-        remask_ratio = 1 - move_chance.squeeze(-1)
+      if refine_variant == 'refine_5':
+        loss_2 = self._refine_multistep_loss(
+          x0, xt, sigma, dsigma, move_chance)
+        return self._combine_loss(
+          loss_1=loss_1, loss_2=loss_2,
+          loss_type=self.config.training.loss_type)
+
+      original_mask = xt == self.mask_index
+      remask_ratio = self._compute_remask_ratio(move_chance)
+
+      if refine_variant in ('refine_3', 'refine_4'):
+        # Get raw (non-SUBS) logits so unmasked positions also have a real
+        # distribution for sampling / confidence ranking.
+        with torch.no_grad():
+          raw_logits = self._backbone_raw_logits(xt, sigma)
+          logits_for_sampling = self.add_gumbel_noise(
+            raw_logits, temperature=self.config.training.temperature)
+          sampled_tokens = logits_for_sampling.argmax(dim=-1)
+        confidence_logits = raw_logits
       else:
-        remask_ratio = torch.full(
-          (move_chance.shape[0],),
-          float(self.config.training.remask_ratio),
-          device=move_chance.device)
-        
-      # Remask lowest-confidence tokens → xt2
-      xt2 = self.remask_tokens(model_output, sampled_tokens, 
-                          xt == self.mask_index,  # original mask
-                          remask_ratio=remask_ratio,
-                          mask_token_id=self.mask_index)
+        with torch.no_grad():
+          logits_for_sampling = self.add_gumbel_noise(
+            model_output, temperature=self.config.training.temperature)
+          sampled_tokens = logits_for_sampling.argmax(dim=-1)
+        confidence_logits = model_output
 
-      # Pass 2: SUBS loss using xt_original so model-filled positions get signal
-      loss_2 = self._second_pass_loss(x0, xt, xt2, sigma, dsigma)
+      if refine_variant == 'refine_4':
+        remask_scope = 'full_context'
+      else:
+        remask_scope = 'masked_only'
+
+      xt2 = self.remask_tokens(
+        confidence_logits, sampled_tokens, original_mask,
+        remask_ratio=remask_ratio,
+        mask_token_id=self.mask_index,
+        scope=remask_scope)
+
+      full_context_loss = refine_variant in (
+        'refine_2', 'refine_3', 'refine_4')
+      loss_2 = self._second_pass_loss(
+        x0, xt, xt2, sigma, dsigma,
+        full_context=full_context_loss)
 
       return self._combine_loss(loss_1=loss_1, loss_2=loss_2, loss_type=self.config.training.loss_type)
     
@@ -985,19 +1007,23 @@ class Diffusion(L.LightningModule):
   # def get_loss(self, loss_1, loss_2, ):
   #   if self.config.trainer.alpha
   
-  def remask_tokens(self,logits, sampled_tokens, original_mask, remask_ratio, mask_token_id):
+  def remask_tokens(self, logits, sampled_tokens, original_mask,
+                    remask_ratio, mask_token_id, scope='masked_only'):
     """
     logits:        (batch, seq_len, vocab) from pass 1
     sampled_tokens: argmax samples from pass 1
     original_mask: bool tensor, True where xt == mask_index (pass 1 masked positions)
     remask_ratio:  fraction of originally-masked positions to remask
+    scope:         'masked_only' restricts candidates to originally-masked
+                   positions; 'full_context' allows any position.
+                   Count of remasks is always remask_ratio * |original_mask|.
     """
     probs = F.softmax(logits, dim=-1)
     sampled_probs = torch.gather(probs, dim=-1, index=sampled_tokens.unsqueeze(-1)).squeeze(-1)
 
-    # only consider originally masked positions for remasking
     confidence = sampled_probs.clone()
-    confidence[~original_mask] = float('inf')  # never remask tokens that weren't masked    
+    if scope == 'masked_only':
+      confidence[~original_mask] = float('inf')
 
     masked_tokens = sampled_tokens.clone()
     for b in range(sampled_tokens.shape[0]):
@@ -1009,34 +1035,114 @@ class Diffusion(L.LightningModule):
 
     return masked_tokens
 
-  def _second_pass_loss(self, x0, xt_original, xt2, sigma, dsigma):
+  def _compute_remask_ratio(self, move_chance):
+    if self.config.training.remask_ratio == "random":
+      return torch.rand(move_chance.shape[0], device=move_chance.device)
+    if self.config.training.remask_ratio == "t":
+      return 1 - move_chance.squeeze(-1)
+    return torch.full(
+      (move_chance.shape[0],),
+      float(self.config.training.remask_ratio),
+      device=move_chance.device)
+
+  def _backbone_raw_logits(self, x, sigma):
+    """Run backbone without SUBS clamp; suppress only the mask token.
+
+    Returns log-probabilities over the vocab.
+    """
+    sigma_proc = self._process_sigma(sigma)
+    with torch.cuda.amp.autocast(dtype=torch.float32):
+      logits = self.backbone(x, sigma_proc)
+    logits[:, :, self.mask_index] += self.neg_infinity
+    logits = logits - torch.logsumexp(logits, dim=-1, keepdim=True)
+    return logits
+
+  def _second_pass_loss(self, x0, xt_original, xt2, sigma, dsigma,
+                        full_context=False):
     """
     x0:          ground truth tokens
-    xt_original: masked sequence from pass 1 — defines which positions 
+    xt_original: masked sequence from pass 1 — defines which positions
                  SUBS treats as 'masked' (includes model-filled positions)
-    xt2:         remasked sequence actually fed to backbone 
+    xt2:         remasked sequence actually fed to backbone
                  (model-filled tokens + remasked low-confidence positions)
     sigma/dsigma: same noise level as pass 1
+    full_context: if True, compute loss over the entire context window by
+                  letting the model produce a real distribution at
+                  originally-unmasked positions (skip the SUBS clamp).
     """
-    # Run backbone on xt2 (the remasked sequence)
     with torch.cuda.amp.autocast(dtype=torch.float32):
         logits_2 = self.backbone(xt2, self._process_sigma(sigma))
-    
-    # Apply SUBS parameterization using ORIGINAL xt — this is the key:
-    # positions filled by the model in pass 1 still appear as masked here,
-    # so they receive gradient signal in pass 2
+
     logits_2[:, :, self.mask_index] += self.neg_infinity
     logits_2 = logits_2 - torch.logsumexp(logits_2, dim=-1, keepdim=True)
-    
-    # commented out during proseco training
-    unmasked_indices = (xt_original != self.mask_index)  # only truly unmasked (never touched)
-    logits_2[unmasked_indices] = self.neg_infinity
-    logits_2[unmasked_indices, xt_original[unmasked_indices]] = 0
 
-    # Same SUBS ELBO loss as pass 1
+    if not full_context:
+      unmasked_indices = (xt_original != self.mask_index)
+      logits_2[unmasked_indices] = self.neg_infinity
+      logits_2[unmasked_indices, xt_original[unmasked_indices]] = 0
+
     log_p_theta = torch.gather(
         logits_2, dim=-1, index=x0[:, :, None]).squeeze(-1)
     return -log_p_theta * (dsigma / torch.expm1(sigma))[:, None]
+
+  def _refine_multistep_loss(self, x0, xt, sigma, dsigma, move_chance,
+                             num_passes=5):
+    """Refine_5: progressively reveal originally-masked positions over
+    `num_passes` passes. At pass k (1..num_passes), commit the (k/num_passes)
+    fraction of originally-masked positions with highest model confidence;
+    the rest stay masked. Originally-unmasked positions are never touched.
+
+    Each pass contributes a full-context SUBS-style loss; the final loss is
+    the average across passes.
+    """
+    original_mask = xt == self.mask_index
+    n_masked_per_row = original_mask.sum(dim=-1)
+    batch_size, seq_len = xt.shape
+    device = xt.device
+
+    losses = []
+    current_input = xt
+    for k in range(1, num_passes + 1):
+      with torch.no_grad():
+        raw_logits = self._backbone_raw_logits(current_input, sigma)
+        probs = F.softmax(raw_logits, dim=-1)
+        noisy_logits = self.add_gumbel_noise(
+          raw_logits, temperature=self.config.training.temperature)
+        sampled_tokens = noisy_logits.argmax(dim=-1)
+        sampled_probs = torch.gather(
+          probs, dim=-1,
+          index=sampled_tokens.unsqueeze(-1)).squeeze(-1)
+
+        # Confidence restricted to originally-masked positions.
+        confidence = sampled_probs.clone()
+        confidence[~original_mask] = float('-inf')
+
+        # At pass k, commit floor((k/num_passes) * n_masked) positions.
+        next_input = current_input.clone()
+        for b in range(batch_size):
+          n_commit = int(
+            (k / num_passes) * n_masked_per_row[b].item())
+          if n_commit <= 0:
+            continue
+          _, top_idx = torch.topk(
+            confidence[b], k=n_commit, largest=True)
+          # Start from xt (so previously-committed positions can be
+          # overwritten with the latest pass's prediction) and only fill
+          # the top-confident k/num_passes positions; rest stay masked.
+          row = xt[b].clone()
+          row[top_idx] = sampled_tokens[b, top_idx]
+          next_input[b] = row
+
+      # Full-context SUBS-style loss for this pass, using next_input as the
+      # backbone's input. xt_original=xt keeps the SUBS notion consistent
+      # (originally-masked positions remain the "masked" set), but
+      # full_context=True means loss flows everywhere.
+      loss_k = self._second_pass_loss(
+        x0, xt, next_input, sigma, dsigma, full_context=True)
+      losses.append(loss_k)
+      current_input = next_input
+
+    return torch.stack(losses, dim=0).mean(dim=0)
 
   def add_gumbel_noise(self, logits, temperature):
     '''

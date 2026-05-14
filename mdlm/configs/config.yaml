@@ -47,6 +47,7 @@ training:
   temperature: 0.0
   remask_ratio: 0.5
   refine: True
+  refine_variant: refine_1
   loss_type: "alpha"
 
 eval:
